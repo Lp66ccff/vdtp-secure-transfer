@@ -46,7 +46,6 @@ def load_secret(path: str) -> bytes:
 TICKET_SECRET = load_secret(os.path.join(DATA_DIR, "ticket.key"))
 
 BUCKETS: dict[str, BK.TokenBucket] = {}
-PENDING: dict[str, dict] = {}
 PENDING_TTL = 600
 
 
@@ -118,7 +117,8 @@ class Session:
         await self.send(ftype, P.control(obj), stream=stream)
 
     async def error(self, code: str, msg: str, stream: int = 0) -> None:
-        await self.send_json(P.T_ERROR, {"code": code, "msg": msg, "stream": stream})
+        await self.send_json(P.T_ERROR, {"code": code, "msg": msg, "stream": stream},
+                             stream=stream)
 
 
 @app.websocket("/ws")
@@ -166,8 +166,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
             elif isinstance(st, X.Download) and st.task:
                 st.task.cancel()
         if parked and sess.user:
-            PENDING[sess.sid] = {"user": sess.user["name"], "streams": parked,
-                                 "expires": time.time() + PENDING_TTL}
+            store.save_pending(sess.sid, sess.user["name"], json.dumps(parked),
+                               time.time() + PENDING_TTL)
         sess.streams.clear()
         try:
             await ws.close()
@@ -318,12 +318,19 @@ async def on_open(sess: Session, fr: P.Frame) -> None:
         tier = sess.user["tier"]
         quota = QUOTA_BYTES.get(tier, QUOTA_BYTES["free"])
         used = store.user_usage(sess.user["name"])
+        if os.path.exists(target) and not body.get("overwrite"):
+            await sess.error("DENIED", "同名文件已存在，换名或带 overwrite 再传",
+                             stream=fr.stream)
+            return
         if used + size > quota:
             await sess.error("DENIED", f"超出配额：已用 {used}，本次 {size}，上限 {quota}",
                              stream=fr.stream)
             return
-        stream = sess.next_stream
-        sess.next_stream += 1
+        stream = fr.stream or sess.next_stream
+        if fr.stream and fr.stream in sess.streams:
+            await sess.error("BAD_STREAM", "流号已被占用", stream=fr.stream)
+            return
+        sess.next_stream = max(sess.next_stream, stream) + 1
         parts = os.path.join(DATA_DIR, "parts")
         os.makedirs(parts, exist_ok=True)
         temp = os.path.join(parts, f"{sess.user['name']}-{sess.sid}-{stream}")
@@ -335,8 +342,11 @@ async def on_open(sess: Session, fr: P.Frame) -> None:
     if not os.path.isfile(target):
         await sess.error("NOT_FOUND", "文件不存在", stream=fr.stream)
         return
-    stream = sess.next_stream
-    sess.next_stream += 1
+    if fr.stream and fr.stream in sess.streams:
+        await sess.error("BAD_STREAM", "流号已被占用", stream=fr.stream)
+        return
+    stream = fr.stream or sess.next_stream
+    sess.next_stream = max(sess.next_stream, stream) + 1
     dn = X.Download(stream, rel, target, os.path.getsize(target),
                     int(body.get("offset", 0) or 0))
     sess.streams[stream] = dn
@@ -381,7 +391,7 @@ async def on_done(sess: Session, fr: P.Frame) -> None:
     body = P.parse_control(fr.payload)
     if isinstance(st, X.Upload):
         try:
-            st.finish(int(body.get("size", -1)), str(body.get("sha256", "")))
+            st.finish(int(body.get("size", -1)), str(body.get("sha256") or ""))
         except (X.TransferError, TypeError, ValueError) as exc:
             code = getattr(exc, "code", "BAD_FRAME")
             msg = getattr(exc, "msg", str(exc))
@@ -403,10 +413,13 @@ async def on_resume(sess: Session, fr: P.Frame) -> None:
     if not payload or payload.get("user") != sess.user["name"]:
         await sess.error("RESUME_REJECTED", "票据无效或过期")
         return
-    parked = PENDING.pop(str(payload.get("sid", "")), None)
-    if not parked or parked["expires"] < time.time():
+    sid = str(payload.get("sid", ""))
+    got = store.load_pending(sid, time.time())
+    if not got:
         await sess.error("RESUME_REJECTED", "没有可恢复的会话")
         return
+    store.drop_pending(sid)
+    parked = {"user": got[0], "streams": json.loads(got[1])}
     streams = []
     for meta in parked["streams"]:
         if not os.path.exists(meta["temp"]):

@@ -50,6 +50,10 @@ function fmtSize(bytes) {
   return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
 }
 
+function pct(done, total) {
+  return total ? `${Math.min(100, Math.round((done / total) * 100))}%` : '100%'
+}
+
 function fmtTime(ts) {
   if (!ts) return '—'
   return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }).slice(5, 16)
@@ -273,10 +277,10 @@ function listFiles(path) {
   send(T.LIST, control({ path }))
 }
 
-function pushItem(name, size) {
+function pushItem(name, size, kind = 'up') {
   itemSeq += 1
   const item = reactive({
-    id: itemSeq, name, size, done: 0, status: '等待', error: '',
+    id: itemSeq, name, size, kind, done: 0, acked: 0, status: '等待', error: '',
   })
   queue.value.unshift(item)
   return item
@@ -284,18 +288,32 @@ function pushItem(name, size) {
 
 async function uploadOne(file) {
   const rel = files.path ? `${files.path}/${file.name}` : file.name
-  const item = pushItem(file.name, file.size)
+  const item = pushItem(file.name, file.size, 'up')
   item.status = '上传中'
-  item.acked = 0
   activeItem = item
   try {
-    const { root, digest } = await prepareUpload(file)
-    item.digest = digest
-    const stream = nextStream()
-    ch.sendJson(T.OPEN, { path: rel, mode: 'up', size: file.size, root }, stream)
-    const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
-    if (opened.type === T.ERROR) throw new Error(parseControl(opened.payload).msg)
-    await sendUpload(ch, { file, stream, offset: 0, digest, onProgress: (done) => { item.done = done } })
+    const { root } = await prepareUpload(file)
+    let target = rel
+    let stream = nextStream()
+    ch.sendJson(T.OPEN, { path: target, mode: 'up', size: file.size, root }, stream)
+    let opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
+    if (opened.type === T.ERROR) {
+      const err = parseControl(opened.payload)
+      if (!/同名文件已存在/.test(err.msg)) throw new Error(err.msg)
+      // 撞名就加序号重开一条流，用户不用自己改名
+      const m = /^(.*?)(\.[^.]+)?$/.exec(file.name)
+      const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, '')
+      const renamed = `${m[1]}-${stamp}${m[2] || ''}`
+      target = files.path ? `${files.path}/${renamed}` : renamed
+      item.name = renamed
+      stream = nextStream()
+      ch.sendJson(T.OPEN, { path: target, mode: 'up', size: file.size, root }, stream)
+      opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
+      if (opened.type === T.ERROR) throw new Error(parseControl(opened.payload).msg)
+    }
+    await sendUpload(ch, { file, stream, offset: 0, onProgress: (done) => { item.done = done } })
+    item.done = file.size
+    item.acked = file.size
     item.status = '完成'
     activeItem = null
     listFiles(files.path)
@@ -303,7 +321,7 @@ async function uploadOne(file) {
     if (status.value === 'closed' || /连接断开/.test(err.message)) {
       item.status = '中断'
       if (item.acked) item.done = item.acked
-      resumeCtx = { file, rel, digest: item.digest, item, ticket: lastTicket }
+      resumeCtx = { file, rel, item, ticket: lastTicket }
       resumable.value = { name: file.name, size: file.size }
     } else {
       item.status = '失败'
@@ -349,7 +367,7 @@ async function continueResume(streams) {
   resumable.value = null
   try {
     await sendUpload(ch, {
-      file: ctx.file, stream: found.stream, offset: found.offset, digest: ctx.digest,
+      file: ctx.file, stream: found.stream, offset: found.offset,
       onProgress: (done) => { ctx.item.done = done },
     })
     ctx.item.status = '完成'
@@ -365,7 +383,7 @@ async function fetchEntry(entry) {
     listFiles(files.path ? `${files.path}/${entry.name}` : entry.name)
     return
   }
-  const item = pushItem(entry.name, entry.size)
+  const item = pushItem(entry.name, entry.size, 'down')
   item.status = '下载中'
   try {
     const rel = files.path ? `${files.path}/${entry.name}` : entry.name
@@ -462,10 +480,16 @@ function leave() {
             <li v-for="item in queue" :key="item.id" :class="item.status">
               <div class="line">
                 <span class="qname">{{ item.name }}</span>
-                <span class="qmeta mono">{{ fmtSize(item.done) }} / {{ fmtSize(item.size) }}</span>
+                <span class="qmeta mono">
+                  <template v-if="item.kind === 'up'">已确认 {{ fmtSize(item.acked) }} · 已发 {{ fmtSize(item.done) }} / {{ fmtSize(item.size) }}</template>
+                  <template v-else>{{ fmtSize(item.done) }} / {{ fmtSize(item.size) }}</template>
+                </span>
                 <span class="qstatus">{{ item.status === '失败' ? item.error : item.status }}</span>
               </div>
-              <div class="bar"><span :style="{ width: item.size ? `${Math.round((item.done / item.size) * 100)}%` : '100%' }" /></div>
+              <div class="bar">
+                <span class="sent" :style="{ width: pct(item.done, item.size) }" />
+                <span v-if="item.kind === 'up'" class="acked" :style="{ width: pct(item.acked, item.size) }" />
+              </div>
             </li>
           </ul>
 
@@ -600,10 +624,13 @@ h2 { margin: 0 0 12px; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04
 .qstatus { min-width: 48px; text-align: right; color: var(--dim); }
 .queue .完成 .qstatus { color: var(--ok); }
 .queue .失败 .qstatus { color: var(--err); }
-.bar { margin-top: 4px; height: 4px; border-radius: 2px; background: #1c242d; overflow: hidden; }
-.bar span { display: block; height: 100%; background: var(--accent); transition: width 0.15s linear; }
-.queue .完成 .bar span { background: var(--ok); }
-.queue .失败 .bar span { background: var(--err); }
+.bar { position: relative; margin-top: 4px; height: 4px; border-radius: 2px; background: #1c242d; overflow: hidden; }
+.bar span { position: absolute; inset: 0 auto 0 0; height: 100%; transition: width 0.15s linear; }
+.bar .sent { background: #2f4a66; }
+.bar .acked { background: var(--accent); }
+.queue .完成 .bar .sent { background: var(--ok); }
+.queue .完成 .bar .acked { background: var(--ok); }
+.queue .失败 .bar .sent { background: var(--err); }
 
 .resume {
   display: flex; align-items: center; gap: 10px; margin-top: 14px; padding: 10px 12px;

@@ -66,13 +66,13 @@ class Upload:
         self.leaves.append(merkle.leaf(chunk))
         self.offset += len(chunk)
 
-    def finish(self, size: int, sha256: str) -> None:
+    def finish(self, size: int, sha256: str = "") -> None:
         self.fh.flush()
         os.fsync(self.fh.fileno())
         self.fh.close()
         if size != self.size or self.offset != self.size:
             raise TransferError("BAD_FRAME", f"大小不符：声明 {self.size}，收到 {self.offset}")
-        if self.digest.hexdigest() != sha256:
+        if sha256 and self.digest.hexdigest() != sha256:
             raise TransferError("HASH_MISMATCH", "全文 SHA-256 不符")
         if merkle.root_of(self.leaves) != self.root:
             raise TransferError("HASH_MISMATCH", "Merkle 根不符")

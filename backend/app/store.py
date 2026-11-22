@@ -13,6 +13,13 @@ import time
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending (
+    sid     TEXT PRIMARY KEY,
+    user    TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    expires REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS users (
     name       TEXT PRIMARY KEY,
     pubkey_jwk TEXT NOT NULL,
@@ -72,6 +79,29 @@ class Store:
         )
         self.conn.commit()
         return True
+
+    # ---------------------------------------------------------------- 挂起的会话
+    def save_pending(self, sid: str, name: str, payload: str, expires: float) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pending (sid, user, payload, expires) VALUES (?, ?, ?, ?)",
+            (sid, name, payload, expires))
+        self.conn.commit()
+
+    def load_pending(self, sid: str, now: float) -> tuple[str, str] | None:
+        row = self.conn.execute(
+            "SELECT user, payload, expires FROM pending WHERE sid = ?", (sid,)).fetchone()
+        if not row or float(row["expires"]) < now:
+            return None
+        return row["user"], row["payload"]
+
+    def drop_pending(self, sid: str) -> None:
+        self.conn.execute("DELETE FROM pending WHERE sid = ?", (sid,))
+        self.conn.commit()
+
+    def sweep_pending(self, now: float) -> int:
+        cur = self.conn.execute("DELETE FROM pending WHERE expires < ?", (now,))
+        self.conn.commit()
+        return cur.rowcount
 
     def set_tier(self, name: str, tier: str) -> bool:
         cur = self.conn.execute("UPDATE users SET tier = ? WHERE name = ?", (tier, name))

@@ -16,19 +16,18 @@ function errorOf(frame) {
   return new Error(`${body.code}：${body.msg}`)
 }
 
-// 算出 Merkle 根与全文摘要；两者分别用在 OPEN 与 DONE 里。
+// 只算 Merkle 根：分块流式算，不把整份文件读进内存。
+// 全文摘要由服务端边写边算，DONE_OK 里回给客户端展示。
 export async function prepareUpload(file) {
   const leaves = []
   for (let off = 0; off < file.size; off += CHUNK) {
     leaves.push(await leaf(new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer())))
   }
-  const root = toHex(await rootOf(leaves))
-  const digest = toHex(await sha256(new Uint8Array(await file.arrayBuffer())))
-  return { root, digest }
+  return { root: toHex(await rootOf(leaves)) }
 }
 
 // 从 offset 起把剩下的块发完，DONE 收尾。续传时 offset 用服务端报的。
-export async function sendUpload(ch, { file, stream, offset, digest, onProgress }) {
+export async function sendUpload(ch, { file, stream, offset, onProgress }) {
   let lastAck = offset
   for (let off = offset; off < file.size; off += CHUNK) {
     const chunk = new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer())
@@ -40,20 +39,20 @@ export async function sendUpload(ch, { file, stream, offset, digest, onProgress 
       lastAck = parseControl(ack.payload).offset
     }
   }
-  ch.sendJson(T.DONE, { size: file.size, sha256: digest }, stream)
+  ch.sendJson(T.DONE, { size: file.size }, stream)
   const done = await ch.waitFor((f) => f.stream === stream && (f.type === T.DONE_OK || f.type === T.ERROR))
   if (done.type === T.ERROR) throw errorOf(done)
   return { stream }
 }
 
 export async function upload(ch, file, name, onProgress) {
-  const { root, digest } = await prepareUpload(file)
+  const { root } = await prepareUpload(file)
   const stream = ch.nextStream()
   ch.sendJson(T.OPEN, { path: name, mode: 'up', size: file.size, root }, stream)
   const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
   if (opened.type === T.ERROR) throw errorOf(opened)
-  await sendUpload(ch, { file, stream, offset: 0, digest, onProgress })
-  return { stream, digest }
+  await sendUpload(ch, { file, stream, offset: 0, onProgress })
+  return { stream, root }
 }
 
 export async function download(ch, path, onProgress) {

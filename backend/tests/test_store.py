@@ -86,3 +86,20 @@ def test_user_usage_counts_files(tmp_path):
     (root / "sub" / "b.bin").write_bytes(b"y" * 50)
     (root / ".part-abc").write_bytes(b"z" * 500)   # 半成品不算
     assert store.user_usage("alice") == 150
+
+
+def test_pending_roundtrip(tmp_path):
+    store = Store(str(tmp_path))
+    store.save_pending("sid1", "alice", '[{"offset": 1024}]', 9e9)
+    assert store.load_pending("sid1", 1.0) == ("alice", '[{"offset": 1024}]')
+    assert store.load_pending("sid1", 1e10) is None      # 过期
+    store.drop_pending("sid1")
+    assert store.load_pending("sid1", 1.0) is None
+
+
+def test_pending_sweep(tmp_path):
+    store = Store(str(tmp_path))
+    store.save_pending("old", "alice", "[]", 1.0)
+    store.save_pending("new", "alice", "[]", 9e9)
+    assert store.sweep_pending(2.0) == 1
+    assert store.load_pending("new", 3.0) is not None
