@@ -1,27 +1,32 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { Decoder, NAMES, T, VER, control, pack, parseControl } from './protocol.js'
 import { loadIdentity, sign } from './identity.js'
 import { register } from './api.js'
+import { download, saveBlob, upload } from './transfer.js'
 
 const user = ref(localStorage.getItem('vdtp.user') || '')
 const entered = ref(false)
-const status = ref('idle') // idle | connecting | open | closed
+const status = ref('idle')
 const banner = ref('')
 const logs = ref([])
 const busy = ref(false)
 const files = reactive({ path: '', entries: [] })
+const queue = ref([])
 const info = reactive({
   sid: '—', rtt: 0, framesIn: 0, framesOut: 0, since: '—',
-  rate: 0, quota: 0, thumb: '', ticket: 0,
+  rate: 0, quota: 0, thumb: '', ticket: 0, bytesIn: 0, bytesOut: 0,
 })
 
 let ws = null
 const dec = new Decoder()
 let seq = 0
+let streamSeq = 0
 let heartbeat = null
 let pingSentAt = 0
 let identity = null
+const waiters = []
+let itemSeq = 0
 
 const url = computed(() => {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
@@ -64,12 +69,54 @@ function log(dir, text) {
   if (logs.value.length > 200) logs.value.pop()
 }
 
-function send(type, payload = new Uint8Array(0)) {
+function send(type, payload = new Uint8Array(0), stream = 0) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return
   seq += 1
-  ws.send(pack(type, payload, { seq }))
+  ws.send(pack(type, payload, { stream, seq }))
   info.framesOut += 1
-  log('out', `${NAMES[type] ?? type} seq=${seq} ${payload.length}B`)
+  info.bytesOut += payload.length
+  if (type !== T.DATA) log('out', `${NAMES[type] ?? type} seq=${seq} ${payload.length}B`)
+}
+
+function sendData(stream, offset, bytes) {
+  const payload = new Uint8Array(8 + bytes.length)
+  new DataView(payload.buffer).setBigUint64(0, BigInt(offset))
+  payload.set(bytes, 8)
+  send(T.DATA, payload, stream)
+}
+
+function nextStream() {
+  streamSeq += 1
+  return streamSeq
+}
+
+function waitFor(pred, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const entry = { pred, resolve, reject }
+    entry.timer = setTimeout(() => {
+      const i = waiters.indexOf(entry)
+      if (i >= 0) waiters.splice(i, 1)
+      reject(new Error('等待超时'))
+    }, timeout)
+    waiters.push(entry)
+  })
+}
+
+function dispatchWaiters(frame) {
+  for (let i = waiters.length - 1; i >= 0; i -= 1) {
+    const w = waiters[i]
+    if (!w.pred(frame)) continue
+    clearTimeout(w.timer)
+    waiters.splice(i, 1)
+    w.resolve(frame)
+  }
+}
+
+const ch = {
+  nextStream,
+  sendJson: (type, obj, stream = 0) => send(type, control(obj), stream),
+  sendData,
+  waitFor,
 }
 
 async function enter() {
@@ -105,7 +152,7 @@ function connect() {
     status.value = 'open'
     info.since = new Date().toLocaleTimeString('zh-CN', { hour12: false })
     log('sys', `连上 ${url.value}`)
-    send(T.HELLO, control({ ver: VER, user: user.value.trim(), caps: ['ping', 'list'] }))
+    send(T.HELLO, control({ ver: VER, user: user.value.trim(), caps: ['ping', 'list', 'xfer'] }))
     heartbeat = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) ping()
     }, 30000)
@@ -133,6 +180,11 @@ function connect() {
 
 async function onFrame(frame) {
   info.framesIn += 1
+  info.bytesIn += frame.payload.length
+  dispatchWaiters(frame)
+
+  if (frame.type === T.DATA) return
+
   const name = NAMES[frame.type] ?? `UNKNOWN(${frame.type})`
 
   if (frame.type === T.HELLO_ACK) {
@@ -190,9 +242,50 @@ function listFiles(path) {
   send(T.LIST, control({ path }))
 }
 
-function openEntry(entry) {
-  if (!entry.dir) return
-  listFiles(files.path ? `${files.path}/${entry.name}` : entry.name)
+function pushItem(name, size) {
+  itemSeq += 1
+  const item = reactive({
+    id: itemSeq, name, size, done: 0, status: '等待', error: '',
+  })
+  queue.value.unshift(item)
+  return item
+}
+
+async function handleFiles(event) {
+  const picked = Array.from(event.target.files || [])
+  event.target.value = ''
+  for (const file of picked) {
+    const item = pushItem(file.name, file.size)
+    item.status = '上传中'
+    try {
+      await upload(ch, file, files.path ? `${files.path}/${file.name}` : file.name,
+        (done) => { item.done = done })
+      item.status = '完成'
+      item.done = file.size
+      listFiles(files.path)
+    } catch (err) {
+      item.status = '失败'
+      item.error = err.message
+    }
+  }
+}
+
+async function fetchEntry(entry) {
+  if (entry.dir) {
+    listFiles(files.path ? `${files.path}/${entry.name}` : entry.name)
+    return
+  }
+  const item = pushItem(entry.name, entry.size)
+  item.status = '下载中'
+  try {
+    const rel = files.path ? `${files.path}/${entry.name}` : entry.name
+    const buf = await download(ch, rel, (done) => { item.done = done })
+    await saveBlob(buf, entry.name)
+    item.status = '完成'
+  } catch (err) {
+    item.status = '失败'
+    item.error = err.message
+  }
 }
 
 function upOne() {
@@ -209,12 +302,8 @@ function leave() {
   entered.value = false
   files.path = ''
   files.entries = []
+  queue.value = []
 }
-
-onBeforeUnmount(() => {
-  clearInterval(heartbeat)
-  if (ws) ws.close()
-})
 </script>
 
 <template>
@@ -253,6 +342,10 @@ onBeforeUnmount(() => {
               <span class="crumb mono">{{ crumb }}</span>
               <button class="ghost tiny" @click="upOne" :disabled="!files.path">上一级</button>
               <button class="ghost tiny" @click="listFiles(files.path)">刷新</button>
+              <label class="upload">
+                上传
+                <input type="file" multiple @change="handleFiles" />
+              </label>
             </div>
           </div>
           <table v-if="files.entries.length" class="listing">
@@ -260,14 +353,26 @@ onBeforeUnmount(() => {
               <tr><th>名字</th><th class="num">大小</th><th class="num">修改</th></tr>
             </thead>
             <tbody>
-              <tr v-for="entry in files.entries" :key="entry.name" :class="{ dir: entry.dir }" @click="openEntry(entry)">
+              <tr v-for="entry in files.entries" :key="entry.name" :class="{ dir: entry.dir }" @click="fetchEntry(entry)">
                 <td><span class="icon">{{ entry.dir ? '📁' : '📄' }}</span>{{ entry.name }}</td>
                 <td class="num mono">{{ entry.dir ? '—' : fmtSize(entry.size) }}</td>
                 <td class="num mono">{{ fmtTime(entry.mtime) }}</td>
               </tr>
             </tbody>
           </table>
-          <p v-else class="hint empty">目录是空的。上传在里程碑 3 接上，现在只能看。</p>
+          <p v-else class="hint empty">目录是空的，点右上角「上传」。</p>
+          <p v-if="files.entries.length" class="hint note">点文件下载，点文件夹进入。</p>
+
+          <ul v-if="queue.length" class="queue">
+            <li v-for="item in queue" :key="item.id" :class="item.status">
+              <div class="line">
+                <span class="qname">{{ item.name }}</span>
+                <span class="qmeta mono">{{ fmtSize(item.done) }} / {{ fmtSize(item.size) }}</span>
+                <span class="qstatus">{{ item.status === '失败' ? item.error : item.status }}</span>
+              </div>
+              <div class="bar"><span :style="{ width: item.size ? `${Math.round((item.done / item.size) * 100)}%` : '100%' }" /></div>
+            </li>
+          </ul>
         </article>
 
         <aside class="side">
@@ -288,6 +393,7 @@ onBeforeUnmount(() => {
             <dl class="facts">
               <dt>会话</dt><dd class="mono">{{ info.sid }}</dd>
               <dt>往返</dt><dd class="mono">{{ info.rtt }} ms</dd>
+              <dt>上下行</dt><dd class="mono">{{ fmtSize(info.bytesOut) }} / {{ fmtSize(info.bytesIn) }}</dd>
               <dt>帧数</dt><dd class="mono">收 {{ info.framesIn }} · 发 {{ info.framesOut }}</dd>
               <dt>连上</dt><dd class="mono">{{ info.since }}</dd>
             </dl>
@@ -351,10 +457,7 @@ h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
 .pill.connecting { color: var(--warn); border-color: #4a4029; }
 .pill.closed { color: var(--err); border-color: #4a2c2c; }
 
-.banner {
-  margin: 0 0 16px; padding: 10px 14px; border: 1px solid #4a2c2c;
-  border-radius: 10px; background: #1e1416; color: #ffb4b4; font-size: 13px;
-}
+.banner { margin: 0 0 16px; padding: 10px 14px; border: 1px solid #4a2c2c; border-radius: 10px; background: #1e1416; color: #ffb4b4; font-size: 13px; }
 
 .grid { display: grid; grid-template-columns: 1.55fr 1fr; gap: 16px; margin-bottom: 16px; align-items: start; }
 
@@ -369,6 +472,12 @@ h2 { margin: 0 0 12px; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04
 .tools { display: flex; align-items: center; gap: 8px; }
 .crumb { color: var(--dim); font-size: 12px; }
 
+.upload {
+  position: relative; padding: 3px 10px; border: 1px solid var(--accent); border-radius: 8px;
+  color: var(--accent); font-size: 12px; cursor: pointer;
+}
+.upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+
 .login .row { display: flex; gap: 8px; }
 .login input {
   flex: 1; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px;
@@ -379,10 +488,22 @@ h2 { margin: 0 0 12px; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04
 .listing { width: 100%; border-collapse: collapse; font-size: 13px; }
 .listing th { text-align: left; font-weight: 500; color: var(--dim); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
 .listing td { padding: 7px 8px; border-bottom: 1px solid #1c242d; }
-.listing tr.dir { cursor: pointer; }
+.listing tbody tr { cursor: pointer; }
 .listing tbody tr:hover { background: #1b232c; }
 .listing .num { text-align: right; }
 .icon { margin-right: 8px; }
+
+.queue { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 10px; }
+.queue .line { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; }
+.qname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qmeta { color: var(--dim); }
+.qstatus { min-width: 48px; text-align: right; color: var(--dim); }
+.queue .完成 .qstatus { color: var(--ok); }
+.queue .失败 .qstatus { color: var(--err); }
+.bar { margin-top: 4px; height: 4px; border-radius: 2px; background: #1c242d; overflow: hidden; }
+.bar span { display: block; height: 100%; background: var(--accent); transition: width 0.15s linear; }
+.queue .完成 .bar span { background: var(--ok); }
+.queue .失败 .bar span { background: var(--err); }
 
 .side { display: grid; gap: 16px; }
 
@@ -399,6 +520,7 @@ button.tiny { padding: 3px 10px; font-size: 12px; }
 
 .hint { margin: 0 0 14px; color: var(--dim); font-size: 13px; }
 .hint.empty { margin: 18px 0 6px; }
+.hint.note { margin: 10px 0 0; font-size: 12px; }
 
 .log-head { display: flex; align-items: center; justify-content: space-between; }
 .log-head h2 { margin: 0; }

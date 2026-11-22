@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from . import auth, frame as P
+from . import transfer as X
 from .store import Store, StoreError, resolve_user_path
 
 DATA_DIR = os.environ.get("VDTP_DATA", "data")
@@ -81,13 +82,18 @@ class Session:
         self.nonce = b""
         self.seq = 0
         self.started = time.time()
+        self.streams: dict[int, object] = {}
+        self.next_stream = 1
+        self.send_lock = asyncio.Lock()
 
     def next_seq(self) -> int:
         self.seq += 1
         return self.seq
 
     async def send(self, ftype: int, payload: bytes = b"", *, stream: int = 0) -> None:
-        await self.ws.send_bytes(P.pack(ftype, payload, stream=stream, seq=self.next_seq()))
+        async with self.send_lock:
+            await self.ws.send_bytes(
+                P.pack(ftype, payload, stream=stream, seq=self.next_seq()))
 
     async def send_json(self, ftype: int, obj: dict, *, stream: int = 0) -> None:
         await self.send(ftype, P.control(obj), stream=stream)
@@ -131,6 +137,12 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        for st in list(sess.streams.values()):
+            if isinstance(st, X.Upload):
+                st.abort()
+            elif isinstance(st, X.Download) and st.task:
+                st.task.cancel()
+        sess.streams.clear()
         try:
             await ws.close()
         except RuntimeError:
@@ -152,6 +164,16 @@ async def handle(sess: Session, fr: P.Frame) -> None:
             await sess.send(P.T_PONG)
         case P.T_LIST:
             await on_list(sess, fr)
+        case P.T_OPEN:
+            await on_open(sess, fr)
+        case P.T_DATA:
+            await on_data(sess, fr)
+        case P.T_ACK:
+            await on_ack(sess, fr)
+        case P.T_DONE:
+            await on_done(sess, fr)
+        case P.T_DONE_OK:
+            sess.streams.pop(fr.stream, None)
         case P.T_BYE:
             raise WebSocketDisconnect(code=1000)
         case _:
@@ -234,6 +256,100 @@ async def on_list(sess: Session, fr: P.Frame) -> None:
                         "dir": os.path.isdir(full), "mtime": int(st.st_mtime)})
     await sess.send_json(P.T_LIST_OK, {"path": body.get("path", ""), "entries": entries},
                          stream=fr.stream)
+
+
+async def on_open(sess: Session, fr: P.Frame) -> None:
+    assert sess.user is not None
+    body = P.parse_control(fr.payload)
+    mode = str(body.get("mode", "up"))
+    root = store.user_root(sess.user["name"])
+    rel = str(body.get("path", "")).strip("/")
+    try:
+        target = resolve_user_path(root, rel)
+    except PermissionError as exc:
+        await sess.error("DENIED", str(exc), stream=fr.stream)
+        return
+
+    if mode == "up":
+        try:
+            size = int(body.get("size", 0))
+            declared = bytes.fromhex(str(body.get("root", "")))
+        except (TypeError, ValueError):
+            await sess.error("BAD_FRAME", "OPEN 字段不全", stream=fr.stream)
+            return
+        if size < 0 or size > X.MAX_FILE:
+            await sess.error("DENIED", "文件超过 8 GiB", stream=fr.stream)
+            return
+        if size and len(declared) != 32:
+            await sess.error("BAD_FRAME", "缺 Merkle 根", stream=fr.stream)
+            return
+        stream = sess.next_stream
+        sess.next_stream += 1
+        temp = os.path.join(root, f".part-{sess.sid}-{stream}")
+        sess.streams[stream] = X.Upload(stream, rel, target, temp, size, declared)
+        await sess.send_json(P.T_OPEN_OK, {"stream": stream, "offset": 0, "size": size},
+                             stream=stream)
+        return
+
+    if not os.path.isfile(target):
+        await sess.error("NOT_FOUND", "文件不存在", stream=fr.stream)
+        return
+    stream = sess.next_stream
+    sess.next_stream += 1
+    dn = X.Download(stream, rel, target, os.path.getsize(target))
+    sess.streams[stream] = dn
+    await sess.send_json(P.T_OPEN_OK, {"stream": stream, "offset": 0, "size": dn.size},
+                         stream=stream)
+    dn.task = asyncio.create_task(X.pump(sess, dn))
+
+
+async def on_data(sess: Session, fr: P.Frame) -> None:
+    st = sess.streams.get(fr.stream)
+    if not isinstance(st, X.Upload):
+        await sess.error("BAD_STREAM", "这条流不收数据", stream=fr.stream)
+        return
+    if len(fr.payload) < 8:
+        await sess.error("BAD_FRAME", "DATA 缺偏移前缀", stream=fr.stream)
+        return
+    offset = int.from_bytes(fr.payload[:8], "big")
+    try:
+        st.write(offset, fr.payload[8:])
+    except X.TransferError as exc:
+        await sess.error(exc.code, exc.msg, stream=fr.stream)
+        st.abort()
+        sess.streams.pop(st.id, None)
+        return
+    if st.offset - st.last_ack >= X.ACK_EVERY:
+        st.last_ack = st.offset
+        await sess.send_json(P.T_ACK, {"offset": st.offset}, stream=st.id)
+
+
+async def on_ack(sess: Session, fr: P.Frame) -> None:
+    st = sess.streams.get(fr.stream)
+    if not isinstance(st, X.Download):
+        return
+    body = P.parse_control(fr.payload)
+    st.ack(int(body.get("offset", 0)))
+
+
+async def on_done(sess: Session, fr: P.Frame) -> None:
+    st = sess.streams.get(fr.stream)
+    body = P.parse_control(fr.payload)
+    if isinstance(st, X.Upload):
+        try:
+            st.finish(int(body.get("size", -1)), str(body.get("sha256", "")))
+        except (X.TransferError, TypeError, ValueError) as exc:
+            code = getattr(exc, "code", "BAD_FRAME")
+            msg = getattr(exc, "msg", str(exc))
+            st.abort()
+            sess.streams.pop(st.id, None)
+            await sess.error(code, msg, stream=fr.stream)
+            return
+        sess.streams.pop(st.id, None)
+        await sess.send_json(P.T_DONE_OK, {"stream": st.id}, stream=st.id)
+        return
+    if isinstance(st, X.Download):
+        sess.streams.pop(st.id, None)
 
 
 def main() -> None:  # pragma: no cover - 入口给 uvicorn 用

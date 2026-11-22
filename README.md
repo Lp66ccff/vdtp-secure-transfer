@@ -10,9 +10,11 @@
 - 协议：HELLO/HELLO_ACK → AUTH_CHALLENGE → AUTH_RESPONSE → AUTH_OK，之后 LIST/LIST_OK、PING/PONG，未知消息回 ERROR。
 - 认证：浏览器 WebCrypto 生成密钥对，私钥以不可导出形态存 IndexedDB；服务端比对公钥指纹，验 `nonce‖sid` 的签名，发 HMAC 票据与档位。
 - 目录：用户根目录内的列出与进入，`../` 与越界路径回 DENIED。
-- 单测：27 项，覆盖帧编解码、签名验签、票据、用户存储与路径越界。
+- 上传：256 KiB 分块，OPEN 先报 Merkle 根，每 4 MiB 一次 ACK，DONE 时比对大小、全文 SHA-256 与 Merkle 根，全对才把 `.part` 改名。
+- 下载：服务端按窗口推 DATA，客户端回 ACK，DONE 带全文摘要，客户端校验后才落盘。
+- 单测：32 项，覆盖帧编解码、签名验签、票据、用户存储、路径越界与 Merkle。
 
-上传、下载、续传、限速还没写，里程碑见上层 README。
+断点续传、限速、防注入演示、ACL 脚本还没写，里程碑见上层 README。
 
 ## 结构
 
@@ -21,6 +23,8 @@ backend/
   app/frame.py     16 字节头与消息类型的编解码
   app/auth.py      挑战签名、公钥指纹、票据
   app/store.py     SQLite 用户表与路径钉根
+  app/merkle.py    Merkle 块树
+  app/transfer.py  上传落盘、下载推流与收尾校验
   app/main.py      FastAPI 应用、/api/register 与 /ws 端点
   tests/           单元测试
   tools/smoke.py   对着真服务端跑注册、认证、列目录、越权与心跳
@@ -28,6 +32,8 @@ frontend/
   src/protocol.js  浏览器端的同一套帧编解码
   src/identity.js  密钥对生成、IndexedDB 存取、签名
   src/api.js       注册接口
+  src/merkle.js    浏览器端 Merkle
+  src/transfer.js  上传与下载的分块、ACK 窗口与校验
   src/App.vue      登录、文件列表、身份与会话面板、帧日志
 deploy/
   Dockerfile.backend / Dockerfile.frontend / nginx.conf / docker-compose.yml
