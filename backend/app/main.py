@@ -315,6 +315,13 @@ async def on_open(sess: Session, fr: P.Frame) -> None:
         if size and len(declared) != 32:
             await sess.error("BAD_FRAME", "缺 Merkle 根", stream=fr.stream)
             return
+        tier = sess.user["tier"]
+        quota = QUOTA_BYTES.get(tier, QUOTA_BYTES["free"])
+        used = store.user_usage(sess.user["name"])
+        if used + size > quota:
+            await sess.error("DENIED", f"超出配额：已用 {used}，本次 {size}，上限 {quota}",
+                             stream=fr.stream)
+            return
         stream = sess.next_stream
         sess.next_stream += 1
         parts = os.path.join(DATA_DIR, "parts")

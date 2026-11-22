@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -75,3 +76,13 @@ def test_absolute_path_is_taken_relative_to_root(tmp_path):
     root.mkdir()
     assert resolve_user_path(str(root), "/etc/passwd") == str((root / "etc/passwd").resolve())
     assert resolve_user_path(str(root), "/") == str(root.resolve())
+
+
+def test_user_usage_counts_files(tmp_path):
+    store = Store(str(tmp_path))
+    root = pathlib.Path(store.user_root("alice"))
+    (root / "a.bin").write_bytes(b"x" * 100)
+    (root / "sub").mkdir()
+    (root / "sub" / "b.bin").write_bytes(b"y" * 50)
+    (root / ".part-abc").write_bytes(b"z" * 500)   # 半成品不算
+    assert store.user_usage("alice") == 150

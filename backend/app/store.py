@@ -78,6 +78,20 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def user_usage(self, name: str) -> int:
+        """用户目录里实际占用的字节数，隐藏文件（.part）不算。"""
+        root = self.user_root(name)
+        total = 0
+        for dirpath, _dirs, files in os.walk(root):
+            for filename in files:
+                if filename.startswith("."):
+                    continue
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, filename))
+                except OSError:
+                    pass
+        return total
+
     def user_root(self, name: str) -> str:
         root = os.path.join(self.data, "users", name)
         os.makedirs(root, exist_ok=True)
