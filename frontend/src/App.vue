@@ -282,38 +282,45 @@ function pushItem(name, size) {
   return item
 }
 
+async function uploadOne(file) {
+  const rel = files.path ? `${files.path}/${file.name}` : file.name
+  const item = pushItem(file.name, file.size)
+  item.status = '上传中'
+  item.acked = 0
+  activeItem = item
+  try {
+    const { root, digest } = await prepareUpload(file)
+    item.digest = digest
+    const stream = nextStream()
+    ch.sendJson(T.OPEN, { path: rel, mode: 'up', size: file.size, root }, stream)
+    const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
+    if (opened.type === T.ERROR) throw new Error(parseControl(opened.payload).msg)
+    await sendUpload(ch, { file, stream, offset: 0, digest, onProgress: (done) => { item.done = done } })
+    item.status = '完成'
+    activeItem = null
+    listFiles(files.path)
+  } catch (err) {
+    if (status.value === 'closed' || /连接断开/.test(err.message)) {
+      item.status = '中断'
+      if (item.acked) item.done = item.acked
+      resumeCtx = { file, rel, digest: item.digest, item, ticket: lastTicket }
+      resumable.value = { name: file.name, size: file.size }
+    } else {
+      item.status = '失败'
+      item.error = err.message
+    }
+  }
+}
+
+// 同时最多三条上传流：协议本来就支持多流，队列只是把并发压住。
 async function handleFiles(event) {
   const picked = Array.from(event.target.files || [])
   event.target.value = ''
-  for (const file of picked) {
-    const rel = files.path ? `${files.path}/${file.name}` : file.name
-    const item = pushItem(file.name, file.size)
-    item.status = '上传中'
-    item.acked = 0
-    activeItem = item
-    try {
-      const { root, digest } = await prepareUpload(file)
-      item.digest = digest
-      const stream = nextStream()
-      ch.sendJson(T.OPEN, { path: rel, mode: 'up', size: file.size, root }, stream)
-      const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
-      if (opened.type === T.ERROR) throw new Error(parseControl(opened.payload).msg)
-      await sendUpload(ch, { file, stream, offset: 0, digest, onProgress: (done) => { item.done = done } })
-      item.status = '完成'
-      activeItem = null
-      listFiles(files.path)
-    } catch (err) {
-      if (status.value === 'closed' || /连接断开/.test(err.message)) {
-        item.status = '中断'
-        if (item.acked) item.done = item.acked
-        resumeCtx = { file, rel, digest: item.digest, item, ticket: lastTicket }
-        resumable.value = { name: file.name, size: file.size }
-      } else {
-        item.status = '失败'
-        item.error = err.message
-      }
-    }
-  }
+  const pool = picked.slice()
+  const workers = Array.from({ length: Math.min(3, pool.length) }, async () => {
+    while (pool.length) await uploadOne(pool.shift())
+  })
+  await Promise.all(workers)
 }
 
 function resume() {
