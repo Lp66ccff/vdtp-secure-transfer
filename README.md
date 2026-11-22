@@ -6,27 +6,35 @@
 
 ## 现在能跑什么
 
-- 后端：FastAPI 的 `/ws` 接受 WebSocket，解 16 字节帧，完成 HELLO/HELLO_ACK 握手，回 PONG，未知消息回 ERROR。
-- 前端：连接、显示会话号与挑战、30 秒心跳与往返时延、帧日志。
-- 单测：帧编解码 10 项，含半帧、粘帧、坏 magic、超长声明。
+- 注册：`POST /api/register` 收用户名与 ECDSA P-256 公钥，重复登记同钥返回 `created: false`，异钥返回 409。
+- 协议：HELLO/HELLO_ACK → AUTH_CHALLENGE → AUTH_RESPONSE → AUTH_OK，之后 LIST/LIST_OK、PING/PONG，未知消息回 ERROR。
+- 认证：浏览器 WebCrypto 生成密钥对，私钥以不可导出形态存 IndexedDB；服务端比对公钥指纹，验 `nonce‖sid` 的签名，发 HMAC 票据与档位。
+- 目录：用户根目录内的列出与进入，`../` 与越界路径回 DENIED。
+- 单测：27 项，覆盖帧编解码、签名验签、票据、用户存储与路径越界。
 
-认证、目录、上传、续传、限速还没写，里程碑见上层 README。
+上传、下载、续传、限速还没写，里程碑见上层 README。
 
 ## 结构
 
 ```
 backend/
   app/frame.py     16 字节头与消息类型的编解码
-  app/main.py      FastAPI 应用与 /ws 端点
+  app/auth.py      挑战签名、公钥指纹、票据
+  app/store.py     SQLite 用户表与路径钉根
+  app/main.py      FastAPI 应用、/api/register 与 /ws 端点
   tests/           单元测试
-  tools/smoke.py   对着真服务端跑一遍握手与心跳
+  tools/smoke.py   对着真服务端跑注册、认证、列目录、越权与心跳
 frontend/
   src/protocol.js  浏览器端的同一套帧编解码
-  src/App.vue      连接面板与帧日志
+  src/identity.js  密钥对生成、IndexedDB 存取、签名
+  src/api.js       注册接口
+  src/App.vue      登录、文件列表、身份与会话面板、帧日志
 deploy/
   Dockerfile.backend / Dockerfile.frontend / nginx.conf / docker-compose.yml
 docs/协议.md       协议规范
 ```
+
+运行数据落在 `backend/data/`（`VDTP_DATA` 可改）：`vdtp.db`、`ticket.key`、`users/<用户名>/`。整个目录在 `.gitignore` 里。
 
 ## 本地起
 

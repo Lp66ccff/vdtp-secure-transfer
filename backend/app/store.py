@@ -1,0 +1,79 @@
+"""用户与文件元数据的存储。SQLite，查询一律参数化。
+
+表结构随里程碑长，现在只有用户。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+import time
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    name       TEXT PRIMARY KEY,
+    pubkey_jwk TEXT NOT NULL,
+    tier       TEXT NOT NULL DEFAULT 'free',
+    created    REAL NOT NULL
+);
+"""
+
+
+class StoreError(Exception):
+    pass
+
+
+def resolve_user_path(root: str, rel: str) -> str:
+    """把请求里的相对路径钉在用户根目录内。越界抛 PermissionError。"""
+    clean = (rel or "").strip("/")
+    if "\x00" in clean:
+        raise PermissionError("路径含空字节")
+    target = os.path.realpath(os.path.join(root, clean))
+    base = os.path.realpath(root)
+    if target != base and not target.startswith(base + os.sep):
+        raise PermissionError("路径越界")
+    return target
+
+
+class Store:
+    def __init__(self, data_dir: str):
+        self.data = os.path.abspath(data_dir)
+        os.makedirs(self.data, exist_ok=True)
+        self.db_path = os.path.join(self.data, "vdtp.db")
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+
+    # ---------------------------------------------------------------- 用户
+    def user(self, name: str) -> dict | None:
+        if not NAME_RE.match(name or ""):
+            return None
+        row = self.conn.execute(
+            "SELECT name, pubkey_jwk, tier, created FROM users WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def register(self, name: str, jwk_json: str, tier: str = "free") -> bool:
+        """新登记返回 True；同名同钥已存在返回 False；同名异钥抛 StoreError。"""
+        if not NAME_RE.match(name or ""):
+            raise StoreError("用户名只允许字母、数字、下划线和连字符，1 到 32 位")
+        old = self.user(name)
+        if old:
+            if old["pubkey_jwk"] != jwk_json:
+                raise StoreError("这个用户名已经登记了别的公钥")
+            return False
+        self.conn.execute(
+            "INSERT INTO users (name, pubkey_jwk, tier, created) VALUES (?, ?, ?, ?)",
+            (name, jwk_json, tier, time.time()),
+        )
+        self.conn.commit()
+        return True
+
+    def user_root(self, name: str) -> str:
+        root = os.path.join(self.data, "users", name)
+        os.makedirs(root, exist_ok=True)
+        return root
