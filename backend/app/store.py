@@ -73,6 +73,11 @@ class Store:
         self.conn.commit()
         return True
 
+    def set_tier(self, name: str, tier: str) -> bool:
+        cur = self.conn.execute("UPDATE users SET tier = ? WHERE name = ?", (tier, name))
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def user_root(self, name: str) -> str:
         root = os.path.join(self.data, "users", name)
         os.makedirs(root, exist_ok=True)

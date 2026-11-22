@@ -1,4 +1,4 @@
-// 上传与下载：分块、Merkle 根、ACK 窗口、收尾校验。
+// 上传与下载：分块、Merkle 根、ACK 窗口、收尾校验，以及续传用的分段函数。
 // ch 是小适配器：{ nextStream, sendJson, sendData, waitFor }。
 
 import { T, control, parseControl } from './protocol.js'
@@ -16,21 +16,21 @@ function errorOf(frame) {
   return new Error(`${body.code}：${body.msg}`)
 }
 
-export async function upload(ch, file, name, onProgress) {
+// 算出 Merkle 根与全文摘要；两者分别用在 OPEN 与 DONE 里。
+export async function prepareUpload(file) {
   const leaves = []
   for (let off = 0; off < file.size; off += CHUNK) {
     leaves.push(await leaf(new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer())))
   }
   const root = toHex(await rootOf(leaves))
   const digest = toHex(await sha256(new Uint8Array(await file.arrayBuffer())))
+  return { root, digest }
+}
 
-  const stream = ch.nextStream()
-  ch.sendJson(T.OPEN, { path: name, mode: 'up', size: file.size, root }, stream)
-  const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
-  if (opened.type === T.ERROR) throw errorOf(opened)
-
-  let lastAck = 0
-  for (let off = 0; off < file.size; off += CHUNK) {
+// 从 offset 起把剩下的块发完，DONE 收尾。续传时 offset 用服务端报的。
+export async function sendUpload(ch, { file, stream, offset, digest, onProgress }) {
+  let lastAck = offset
+  for (let off = offset; off < file.size; off += CHUNK) {
     const chunk = new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer())
     ch.sendData(stream, off, chunk)
     onProgress(Math.min(off + CHUNK, file.size), file.size)
@@ -40,10 +40,19 @@ export async function upload(ch, file, name, onProgress) {
       lastAck = parseControl(ack.payload).offset
     }
   }
-
   ch.sendJson(T.DONE, { size: file.size, sha256: digest }, stream)
   const done = await ch.waitFor((f) => f.stream === stream && (f.type === T.DONE_OK || f.type === T.ERROR))
   if (done.type === T.ERROR) throw errorOf(done)
+  return { stream }
+}
+
+export async function upload(ch, file, name, onProgress) {
+  const { root, digest } = await prepareUpload(file)
+  const stream = ch.nextStream()
+  ch.sendJson(T.OPEN, { path: name, mode: 'up', size: file.size, root }, stream)
+  const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
+  if (opened.type === T.ERROR) throw errorOf(opened)
+  await sendUpload(ch, { file, stream, offset: 0, digest, onProgress })
   return { stream, digest }
 }
 

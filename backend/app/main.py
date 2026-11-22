@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from . import auth, frame as P
+from . import bucket as BK
 from . import transfer as X
 from .store import Store, StoreError, resolve_user_path
 
@@ -43,6 +44,19 @@ def load_secret(path: str) -> bytes:
 
 
 TICKET_SECRET = load_secret(os.path.join(DATA_DIR, "ticket.key"))
+
+BUCKETS: dict[str, BK.TokenBucket] = {}
+PENDING: dict[str, dict] = {}
+PENDING_TTL = 600
+
+
+def bucket_for(name: str, tier: str) -> BK.TokenBucket:
+    rate = RATE_BPS.get(tier, RATE_BPS["free"])
+    got = BUCKETS.get(name)
+    if got is None or got.rate != rate:
+        got = BK.TokenBucket(rate, burst=256 << 10)
+        BUCKETS[name] = got
+    return got
 
 
 class RegisterBody(BaseModel):
@@ -85,6 +99,8 @@ class Session:
         self.streams: dict[int, object] = {}
         self.next_stream = 1
         self.send_lock = asyncio.Lock()
+        self.ticket = ""
+        self.bucket: BK.TokenBucket | None = None
 
     def next_seq(self) -> int:
         self.seq += 1
@@ -137,11 +153,18 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        parked = []
         for st in list(sess.streams.values()):
             if isinstance(st, X.Upload):
-                st.abort()
+                if st.offset > 0:
+                    parked.append(st.park())
+                else:
+                    st.abort()
             elif isinstance(st, X.Download) and st.task:
                 st.task.cancel()
+        if parked and sess.user:
+            PENDING[sess.sid] = {"user": sess.user["name"], "streams": parked,
+                                 "expires": time.time() + PENDING_TTL}
         sess.streams.clear()
         try:
             await ws.close()
@@ -174,6 +197,8 @@ async def handle(sess: Session, fr: P.Frame) -> None:
             await on_done(sess, fr)
         case P.T_DONE_OK:
             sess.streams.pop(fr.stream, None)
+        case P.T_RESUME:
+            await on_resume(sess, fr)
         case P.T_BYE:
             raise WebSocketDisconnect(code=1000)
         case _:
@@ -225,6 +250,8 @@ async def on_auth_response(sess: Session, fr: P.Frame) -> None:
         "pub": auth.thumbprint(stored),
         "exp": int(time.time()) + TICKET_TTL,
     })
+    sess.ticket = ticket
+    sess.bucket = bucket_for(sess.user["name"], tier)
     await sess.send_json(P.T_AUTH_OK, {
         "user": sess.user["name"],
         "ticket": ticket,
@@ -247,6 +274,8 @@ async def on_list(sess: Session, fr: P.Frame) -> None:
         return
     entries = []
     for name in sorted(os.listdir(target)):
+        if name.startswith("."):
+            continue
         full = os.path.join(target, name)
         try:
             st = os.stat(full)
@@ -285,7 +314,9 @@ async def on_open(sess: Session, fr: P.Frame) -> None:
             return
         stream = sess.next_stream
         sess.next_stream += 1
-        temp = os.path.join(root, f".part-{sess.sid}-{stream}")
+        parts = os.path.join(DATA_DIR, "parts")
+        os.makedirs(parts, exist_ok=True)
+        temp = os.path.join(parts, f"{sess.user['name']}-{sess.sid}-{stream}")
         sess.streams[stream] = X.Upload(stream, rel, target, temp, size, declared)
         await sess.send_json(P.T_OPEN_OK, {"stream": stream, "offset": 0, "size": size},
                              stream=stream)
@@ -296,11 +327,12 @@ async def on_open(sess: Session, fr: P.Frame) -> None:
         return
     stream = sess.next_stream
     sess.next_stream += 1
-    dn = X.Download(stream, rel, target, os.path.getsize(target))
+    dn = X.Download(stream, rel, target, os.path.getsize(target),
+                    int(body.get("offset", 0) or 0))
     sess.streams[stream] = dn
-    await sess.send_json(P.T_OPEN_OK, {"stream": stream, "offset": 0, "size": dn.size},
+    await sess.send_json(P.T_OPEN_OK, {"stream": stream, "offset": dn.offset, "size": dn.size},
                          stream=stream)
-    dn.task = asyncio.create_task(X.pump(sess, dn))
+    dn.task = asyncio.create_task(X.pump(sess, dn, sess.bucket))
 
 
 async def on_data(sess: Session, fr: P.Frame) -> None:
@@ -312,6 +344,8 @@ async def on_data(sess: Session, fr: P.Frame) -> None:
         await sess.error("BAD_FRAME", "DATA 缺偏移前缀", stream=fr.stream)
         return
     offset = int.from_bytes(fr.payload[:8], "big")
+    if sess.bucket is not None:
+        await sess.bucket.take(len(fr.payload) - 8)
     try:
         st.write(offset, fr.payload[8:])
     except X.TransferError as exc:
@@ -350,6 +384,30 @@ async def on_done(sess: Session, fr: P.Frame) -> None:
         return
     if isinstance(st, X.Download):
         sess.streams.pop(st.id, None)
+
+
+async def on_resume(sess: Session, fr: P.Frame) -> None:
+    assert sess.user is not None
+    body = P.parse_control(fr.payload)
+    payload = auth.verify_ticket(TICKET_SECRET, str(body.get("ticket", "")))
+    if not payload or payload.get("user") != sess.user["name"]:
+        await sess.error("RESUME_REJECTED", "票据无效或过期")
+        return
+    parked = PENDING.pop(str(payload.get("sid", "")), None)
+    if not parked or parked["expires"] < time.time():
+        await sess.error("RESUME_REJECTED", "没有可恢复的会话")
+        return
+    streams = []
+    for meta in parked["streams"]:
+        if not os.path.exists(meta["temp"]):
+            continue
+        st = X.Upload(meta["stream"], meta["rel"], meta["final"], meta["temp"],
+                      meta["size"], bytes.fromhex(meta["root"]), resume=True)
+        sess.streams[st.id] = st
+        sess.next_stream = max(sess.next_stream, st.id + 1)
+        streams.append({"stream": st.id, "mode": "up", "path": st.rel,
+                        "offset": st.offset, "size": st.size, "root": meta["root"]})
+    await sess.send_json(P.T_RESUME_OK, {"sid": sess.sid, "streams": streams})
 
 
 def main() -> None:  # pragma: no cover - 入口给 uvicorn 用

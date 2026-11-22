@@ -1,7 +1,8 @@
-"""块文件传输：上传落盘、下载推流、块校验与收尾。
+"""块文件传输：上传落盘、下载推流、块校验、续传与限速。
 
 上传先落 .part 临时文件，DONE 时比对大小、全文 SHA-256 与 Merkle 根，全对才改名。
-下载由一条后台任务按窗口推 DATA，客户端回 ACK 才继续。
+断线后 .part 留着，续传时按文件内容重建摘要与叶子，偏移从文件大小接着走。
+下载由一条后台任务按窗口推 DATA，客户端回 ACK 才继续；令牌桶在发送前扣额度。
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ class TransferError(Exception):
 
 class Upload:
     def __init__(self, stream: int, rel: str, final: str, temp: str,
-                 size: int, root: bytes):
+                 size: int, root: bytes, *, resume: bool = False):
         self.id = stream
         self.rel = rel
         self.final = final
@@ -39,7 +40,21 @@ class Upload:
         self.last_ack = 0
         self.digest = hashlib.sha256()
         self.leaves: list[bytes] = []
-        self.fh = open(temp, "wb")
+        if resume:
+            self._rebuild()
+        self.fh = open(temp, "ab" if resume else "wb")
+
+    def _rebuild(self) -> None:
+        """按盘上的 .part 重建偏移、摘要与叶子，断线前写的部分接着算。"""
+        with open(self.temp, "rb") as fh:
+            while True:
+                chunk = fh.read(CHUNK)
+                if not chunk:
+                    break
+                self.digest.update(chunk)
+                self.leaves.append(merkle.leaf(chunk))
+        self.offset = os.path.getsize(self.temp)
+        self.last_ack = self.offset
 
     def write(self, offset: int, chunk: bytes) -> None:
         if offset != self.offset:
@@ -64,6 +79,17 @@ class Upload:
         os.makedirs(os.path.dirname(self.final), exist_ok=True)
         os.replace(self.temp, self.final)
 
+    def park(self) -> dict:
+        """断线时把续传需要的东西留下来。"""
+        try:
+            self.fh.flush()
+            self.fh.close()
+        except Exception:
+            pass
+        return {"kind": "up", "stream": self.id, "rel": self.rel, "temp": self.temp,
+                "final": self.final, "size": self.size, "root": self.root.hex(),
+                "offset": self.offset}
+
     def abort(self) -> None:
         try:
             self.fh.close()
@@ -76,13 +102,13 @@ class Upload:
 
 
 class Download:
-    def __init__(self, stream: int, rel: str, path: str, size: int):
+    def __init__(self, stream: int, rel: str, path: str, size: int, offset: int = 0):
         self.id = stream
         self.rel = rel
         self.path = path
         self.size = size
-        self.offset = 0
-        self.acked = 0
+        self.offset = max(0, min(offset, size))
+        self.acked = self.offset
         self.ack_event = asyncio.Event()
         self.task: asyncio.Task | None = None
 
@@ -91,11 +117,14 @@ class Download:
         self.ack_event.set()
 
 
-async def pump(sess, st: Download) -> None:
-    """读一块发一块，窗口满了就等 ACK。"""
-    digest = hashlib.sha256()
+async def pump(sess, st: Download, bucket=None) -> None:
+    """读一块发一块，窗口满了就等 ACK；有桶先扣额度。"""
+    digest = None
     try:
+        if st.offset == 0:
+            digest = hashlib.sha256()
         with open(st.path, "rb") as fh:
+            fh.seek(st.offset)
             while st.offset < st.size:
                 if st.offset - st.acked >= WINDOW:
                     st.ack_event.clear()
@@ -103,9 +132,17 @@ async def pump(sess, st: Download) -> None:
                 chunk = fh.read(min(CHUNK, st.size - st.offset))
                 if not chunk:
                     break
+                if bucket is not None:
+                    await bucket.take(len(chunk))
                 await sess.send(P.T_DATA, P.data(st.offset, chunk), stream=st.id)
-                digest.update(chunk)
+                if digest is not None:
+                    digest.update(chunk)
                 st.offset += len(chunk)
+        if digest is None:
+            digest = hashlib.sha256()
+            with open(st.path, "rb") as fh:
+                for block in iter(lambda: fh.read(CHUNK), b""):
+                    digest.update(block)
         await sess.send_json(P.T_DONE, {"size": st.size, "sha256": digest.hexdigest()},
                              stream=st.id)
     except (asyncio.CancelledError, RuntimeError, ConnectionError):

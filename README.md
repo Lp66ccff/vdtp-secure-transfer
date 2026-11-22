@@ -12,9 +12,11 @@
 - 目录：用户根目录内的列出与进入，`../` 与越界路径回 DENIED。
 - 上传：256 KiB 分块，OPEN 先报 Merkle 根，每 4 MiB 一次 ACK，DONE 时比对大小、全文 SHA-256 与 Merkle 根，全对才把 `.part` 改名。
 - 下载：服务端按窗口推 DATA，客户端回 ACK，DONE 带全文摘要，客户端校验后才落盘。
+- 续传：断线后 `.part` 与偏移挂起 10 分钟，重连 RESUME 报 offset，从断点接着传，DONE 时按整份文件重算摘要与 Merkle 根。
+- 限速：按用户档位配令牌桶，自由档 2 MiB/s、VIP 档 8 MiB/s，突发 256 KiB；下载在推流前扣额度，上传在落盘前扣。
 - 单测：32 项，覆盖帧编解码、签名验签、票据、用户存储、路径越界与 Merkle。
 
-断点续传、限速、防注入演示、ACL 脚本还没写，里程碑见上层 README。
+防注入演示、ACL 脚本、容器验证还没做，里程碑见上层 README。
 
 ## 结构
 
@@ -24,10 +26,14 @@ backend/
   app/auth.py      挑战签名、公钥指纹、票据
   app/store.py     SQLite 用户表与路径钉根
   app/merkle.py    Merkle 块树
-  app/transfer.py  上传落盘、下载推流与收尾校验
+  app/transfer.py  上传落盘、下载推流、收尾校验与续传重建
+  app/bucket.py    令牌桶
   app/main.py      FastAPI 应用、/api/register 与 /ws 端点
   tests/           单元测试
-  tools/smoke.py   对着真服务端跑注册、认证、列目录、越权与心跳
+  tools/smoke.py        注册、认证、列目录、上传下载、越权与心跳
+  tools/resume_smoke.py 传一半掐线，重连续传并核对摘要
+  tools/bench_rate.py   量一档的实际上传速率
+  tools/tier.py         改用户档位（限速演示用）
 frontend/
   src/protocol.js  浏览器端的同一套帧编解码
   src/identity.js  密钥对生成、IndexedDB 存取、签名

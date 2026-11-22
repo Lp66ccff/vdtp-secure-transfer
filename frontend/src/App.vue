@@ -3,7 +3,7 @@ import { computed, reactive, ref } from 'vue'
 import { Decoder, NAMES, T, VER, control, pack, parseControl } from './protocol.js'
 import { loadIdentity, sign } from './identity.js'
 import { register } from './api.js'
-import { download, saveBlob, upload } from './transfer.js'
+import { download, prepareUpload, saveBlob, sendUpload } from './transfer.js'
 
 const user = ref(localStorage.getItem('vdtp.user') || '')
 const entered = ref(false)
@@ -25,8 +25,12 @@ let streamSeq = 0
 let heartbeat = null
 let pingSentAt = 0
 let identity = null
+let lastTicket = ''
+let resumeCtx = null
+const resumable = ref(null)
 const waiters = []
 let itemSeq = 0
+let activeItem = null
 
 const url = computed(() => {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
@@ -102,6 +106,14 @@ function waitFor(pred, timeout = 30000) {
   })
 }
 
+function failWaiters(err) {
+  while (waiters.length) {
+    const w = waiters.pop()
+    clearTimeout(w.timer)
+    w.reject(err)
+  }
+}
+
 function dispatchWaiters(frame) {
   for (let i = waiters.length - 1; i >= 0; i -= 1) {
     const w = waiters[i]
@@ -173,6 +185,7 @@ function connect() {
     clearInterval(heartbeat)
     heartbeat = null
     ws = null
+    failWaiters(new Error('连接断开'))
     log('sys', '连接关闭')
   }
   ws.onerror = () => log('err', '连接出错')
@@ -206,7 +219,13 @@ async function onFrame(frame) {
     info.rate = ok.rate
     info.quota = ok.quota
     info.ticket = ok.ticket.length
+    lastTicket = ok.ticket
     log('in', `AUTH_OK user=${ok.user} 票据=${ok.ticket.length}B`)
+    if (resumeCtx) {
+      // 用断线前那次的票据：新会话的 sid 上没有挂起的流
+      send(T.RESUME, control({ ticket: resumeCtx.ticket }))
+      return
+    }
     ping()
     listFiles('')
     return
@@ -216,6 +235,18 @@ async function onFrame(frame) {
     files.path = body.path || ''
     files.entries = body.entries || []
     log('in', `LIST_OK ${files.entries.length} 项`)
+    return
+  }
+  if (frame.type === T.RESUME_OK) {
+    const body = parseControl(frame.payload)
+    log('in', `RESUME_OK ${(body.streams || []).length} 条流`)
+    continueResume(body.streams || [])
+    return
+  }
+  if (frame.type === T.ACK) {
+    const body = parseControl(frame.payload)
+    if (activeItem) activeItem.acked = body.offset
+    log('in', `ACK offset=${body.offset}`)
     return
   }
   if (frame.type === T.PONG) {
@@ -255,18 +286,70 @@ async function handleFiles(event) {
   const picked = Array.from(event.target.files || [])
   event.target.value = ''
   for (const file of picked) {
+    const rel = files.path ? `${files.path}/${file.name}` : file.name
     const item = pushItem(file.name, file.size)
     item.status = '上传中'
+    item.acked = 0
+    activeItem = item
     try {
-      await upload(ch, file, files.path ? `${files.path}/${file.name}` : file.name,
-        (done) => { item.done = done })
+      const { root, digest } = await prepareUpload(file)
+      item.digest = digest
+      const stream = nextStream()
+      ch.sendJson(T.OPEN, { path: rel, mode: 'up', size: file.size, root }, stream)
+      const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
+      if (opened.type === T.ERROR) throw new Error(parseControl(opened.payload).msg)
+      await sendUpload(ch, { file, stream, offset: 0, digest, onProgress: (done) => { item.done = done } })
       item.status = '完成'
-      item.done = file.size
+      activeItem = null
       listFiles(files.path)
     } catch (err) {
-      item.status = '失败'
-      item.error = err.message
+      if (status.value === 'closed' || /连接断开/.test(err.message)) {
+        item.status = '中断'
+        if (item.acked) item.done = item.acked
+        resumeCtx = { file, rel, digest: item.digest, item, ticket: lastTicket }
+        resumable.value = { name: file.name, size: file.size }
+      } else {
+        item.status = '失败'
+        item.error = err.message
+      }
     }
+  }
+}
+
+function resume() {
+  if (!resumeCtx) return
+  banner.value = ''
+  resumable.value = { name: resumeCtx.file.name, size: resumeCtx.file.size }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connect()
+    return
+  }
+  send(T.RESUME, control({ ticket: resumeCtx.ticket }))
+}
+
+async function continueResume(streams) {
+  const ctx = resumeCtx
+  if (!ctx || !streams.length) {
+    banner.value = '没有可续传的流，重新上传吧'
+    resumeCtx = null
+    resumable.value = null
+    return
+  }
+  const found = streams.find((st) => st.path === ctx.rel) || streams[0]
+  ctx.item.status = '上传中'
+  ctx.item.done = found.offset
+  resumeCtx = null
+  resumable.value = null
+  try {
+    await sendUpload(ch, {
+      file: ctx.file, stream: found.stream, offset: found.offset, digest: ctx.digest,
+      onProgress: (done) => { ctx.item.done = done },
+    })
+    ctx.item.status = '完成'
+    listFiles(files.path)
+  } catch (err) {
+    ctx.item.status = '失败'
+    ctx.item.error = err.message
   }
 }
 
@@ -292,6 +375,11 @@ function upOne() {
   const parts = files.path.split('/').filter(Boolean)
   parts.pop()
   listFiles(parts.join('/'))
+}
+
+// 开发期断线演示用：在控制台或自动化里调用 window.__vdtp.drop() 掐掉连接。
+if (import.meta.env.DEV) {
+  window.__vdtp = { drop: () => ws && ws.close() }
 }
 
 function leave() {
@@ -373,6 +461,11 @@ function leave() {
               <div class="bar"><span :style="{ width: item.size ? `${Math.round((item.done / item.size) * 100)}%` : '100%' }" /></div>
             </li>
           </ul>
+
+          <div v-if="resumable" class="resume">
+            <span>上次没传完：{{ resumable.name }}</span>
+            <button class="tiny" @click="resume">续传</button>
+          </div>
         </article>
 
         <aside class="side">
@@ -504,6 +597,11 @@ h2 { margin: 0 0 12px; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04
 .bar span { display: block; height: 100%; background: var(--accent); transition: width 0.15s linear; }
 .queue .完成 .bar span { background: var(--ok); }
 .queue .失败 .bar span { background: var(--err); }
+
+.resume {
+  display: flex; align-items: center; gap: 10px; margin-top: 14px; padding: 10px 12px;
+  border: 1px dashed #4a4029; border-radius: 10px; background: #1a1811; font-size: 12.5px; color: var(--warn);
+}
 
 .side { display: grid; gap: 16px; }
 
