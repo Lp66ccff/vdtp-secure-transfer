@@ -42,7 +42,10 @@ frontend/
   src/transfer.js  上传与下载的分块、ACK 窗口与校验
   src/App.vue      登录、文件列表、身份与会话面板、帧日志
 deploy/
-  Dockerfile.backend / Dockerfile.frontend / nginx.conf / docker-compose.yml
+  Dockerfile.backend / Dockerfile.frontend / docker-compose.yml
+  nginx.conf       只开 TLS 1.3、HSTS、连接与请求限流
+  gen_certs.sh     生成本地 CA 与服务器证书
+  acl.sh           用户目录的 setfacl 配置与自检
 docs/协议.md       协议规范
 ```
 
@@ -71,18 +74,28 @@ npm run dev        # http://127.0.0.1:5173，/ws 与 /api 由 vite 转到 8000
 
 ```bash
 cd backend
-.venv/bin/python -m pytest -q
-.venv/bin/python tools/smoke.py
+.venv/bin/python -m pytest -q                    # 32 项
+.venv/bin/python tools/smoke.py                  # 注册到上传下载一条龙
+.venv/bin/python tools/resume_smoke.py           # 传一半掐线，重连续传
+.venv/bin/python tools/bench_rate.py 8 free      # 量一档的实际速率
+.venv/bin/python tools/inject_demo.py            # 注入载荷打一遍
+sudo ../deploy/acl.sh data                       # 目录 ACL 配置与自检
 ```
 
-## 容器起
+## 容器起（带 TLS）
 
 ```bash
 cd deploy
-docker compose up --build   # http://127.0.0.1:8080
+./gen_certs.sh                                   # 生成 certs/ 下的 CA 与服务器证书
+docker compose up -d --build                     # 443 映射到 8443，80 映射到 8080
+curl -k https://127.0.0.1:8443/api/health
+cd ../backend && .venv/bin/python tools/smoke.py https://127.0.0.1:8443 --ca ../deploy/certs/ca.crt
 ```
 
-`deploy/` 的 compose 还在草稿状态：TLS 与限流在里程碑 6 接上，现在只有 HTTP 转发。
+nginx 只开 TLS 1.3（TLS 1.2 的握手会被 `protocol version` 拒掉），HTTP 一律 301 到 HTTPS；
+`/api/` 走 `limit_req`（20 r/s，burst 40），单 IP 连接上限 32 条、WebSocket 8 条。
+
+证书只用于本地演示，`deploy/certs/` 在 `.gitignore` 里，不进仓库。
 
 ## 提交前要做的
 

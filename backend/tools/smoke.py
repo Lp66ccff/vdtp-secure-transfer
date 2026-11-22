@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import sys
+import ssl
 import time
 import urllib.request
 
@@ -42,11 +43,15 @@ def sign_raw(key, message: bytes) -> bytes:
     return r.to_bytes(32, "big") + s.to_bytes(32, "big")
 
 
+CA = None
+
+
 def register(base: str, user: str, jwk: dict) -> dict:
     body = json.dumps({"user": user, "pub": jwk}).encode()
     req = urllib.request.Request(base + "/api/register", data=body,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    ctx = ssl.create_default_context(cafile=CA) if CA else None
+    with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
         return json.loads(resp.read())
 
 
@@ -66,6 +71,7 @@ async def main(base: str) -> int:
     print(f"register {user} created={info['created']} thumb={info['thumbprint'][:12]}…")
 
     ws_url = base.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+    ssl_ctx = ssl.create_default_context(cafile=CA) if CA else None
     dec = P.FrameDecoder()
     seq = 0
 
@@ -74,7 +80,7 @@ async def main(base: str) -> int:
         seq += 1
         return seq
 
-    async with connect(ws_url, max_size=2 << 20) as ws:
+    async with connect(ws_url, max_size=2 << 20, ssl=ssl_ctx) as ws:
         t0 = time.perf_counter()
         await ws.send(P.pack(P.T_HELLO, P.control({"ver": P.VER, "user": user,
                                                    "caps": ["ping", "list", "xfer"]}),
@@ -162,5 +168,9 @@ async def main(base: str) -> int:
 
 
 if __name__ == "__main__":
-    base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if "--ca" in sys.argv:
+        CA = sys.argv[sys.argv.index("--ca") + 1]
+        args = [a for a in args if a != CA]
+    base = args[0] if args else "http://127.0.0.1:8000"
     raise SystemExit(asyncio.run(main(base)))

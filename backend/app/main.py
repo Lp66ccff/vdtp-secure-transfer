@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from . import auth, frame as P
 from . import bucket as BK
 from . import transfer as X
-from .store import Store, StoreError, resolve_user_path
+from .store import NAME_RE, Store, StoreError, resolve_user_path
 
 DATA_DIR = os.environ.get("VDTP_DATA", "data")
 HANDSHAKE_TIMEOUT = 5.0
@@ -71,6 +71,9 @@ async def health() -> dict:
 
 @app.post("/api/register")
 async def register(body: RegisterBody) -> dict:
+    if not NAME_RE.match(body.user or ""):
+        raise HTTPException(status_code=400,
+                            detail="用户名只允许字母、数字、下划线、连字符，1 到 32 位")
     try:
         auth.jwk_to_public(body.pub)
     except (ValueError, KeyError, TypeError):
