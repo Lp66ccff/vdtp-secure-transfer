@@ -55,6 +55,7 @@ function onFrame(frame) {
     info.nonce = ack.nonce.slice(0, 16) + '…'
     info.ver = ack.ver
     log('in', `HELLO_ACK sid=${ack.sid} nonce=${ack.nonce.length / 2}B`)
+    ping() // 握手完先量一次往返，不用等第一个 30 秒心跳
     return
   }
   if (frame.type === T.PONG) {
