@@ -2,7 +2,7 @@
 
 安全的文件传输 Web 应用：自定义应用层协议跑在 WebSocket 二进制帧上，浏览器就是客户端。软件与系统安全实验 1B 的实现。
 
-![登录与文件列表](docs/shots/01-login.png)
+![登录与文件列表](docs/login.png)
 
 ## 功能
 
@@ -87,8 +87,9 @@ deploy/
   nginx.conf（TLS 1.3、HSTS、连接与请求限流）、gen_certs.sh、acl.sh
 docs/
   协议.md       协议规范
-  报告.md       实验报告源
-  shots/        报告与本文用的截图
+  login.png     README 用的界面截图
 ```
 
-运行数据落在 `backend/data/`（`VDTP_DATA` 可改）：`vdtp.db`、`ticket.key`、`users/<用户名>/`。它和 `deploy/certs/` 都在 `.gitignore` 里，不进仓库。
+运行数据放在仓库外：`$XDG_DATA_HOME/vdtp`，缺省 `~/.local/share/vdtp`，用 `VDTP_DATA` 可以改。里面有 `vdtp.db`、`ticket.key` 与 `users/<用户名>/`。
+
+演示证书在 `~/.config/vdtp/certs`（`gen_certs.sh` 生成，参数可改目录）；容器把数据放在 `vdtp-data` 卷里。两处都不进仓库。

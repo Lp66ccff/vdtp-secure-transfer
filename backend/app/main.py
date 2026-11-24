@@ -21,7 +21,14 @@ from .limits import Limits
 from . import transfer as X
 from .store import NAME_RE, Store, StoreError, resolve_user_path
 
-DATA_DIR = os.environ.get("VDTP_DATA", "data")
+def default_data_dir() -> str:
+    """数据放仓库外：$XDG_DATA_HOME/vdtp，缺省 ~/.local/share/vdtp。"""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "vdtp")
+
+
+DATA_DIR = os.environ.get("VDTP_DATA") or default_data_dir()
 HANDSHAKE_TIMEOUT = 5.0
 HEARTBEAT_TIMEOUT = 120.0
 TICKET_TTL = 3600

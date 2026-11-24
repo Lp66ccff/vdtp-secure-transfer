@@ -2,7 +2,7 @@
 # 服务端目录的访问控制：每个用户一个根目录，服务账号只拿读写权，其它人无权。
 #
 # 用法：sudo ./acl.sh <数据目录>
-#   例：sudo ./acl.sh ../backend/data
+#   例：sudo ./acl.sh ~/.local/share/vdtp
 #
 # 做三件事：
 #   1. 建 vdtp 组与用户目录，目录权限 750，属主是跑服务的账号；

@@ -8,7 +8,7 @@ services:
       VDTP_PORT: "8000"
       VDTP_DATA: /data
     volumes:
-      - ../backend/data:/data
+      - vdtp-data:/data
     expose:
       - "8000"
 
@@ -20,6 +20,9 @@ services:
       - "8080:80"
       - "8443:443"
     volumes:
-      - ./certs:/etc/nginx/certs:ro
+      - ${HOME}/.config/vdtp/certs:/etc/nginx/certs:ro
     depends_on:
       - backend
+
+volumes:
+  vdtp-data:
