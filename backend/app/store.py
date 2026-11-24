@@ -26,6 +26,17 @@ CREATE TABLE IF NOT EXISTS users (
     tier       TEXT NOT NULL DEFAULT 'free',
     created    REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     REAL NOT NULL,
+    sid    TEXT,
+    user   TEXT,
+    event  TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts);
 """
 
 
@@ -102,6 +113,27 @@ class Store:
         cur = self.conn.execute("DELETE FROM pending WHERE expires < ?", (now,))
         self.conn.commit()
         return cur.rowcount
+
+    # ---------------------------------------------------------------- 审计
+    def audit(self, event: str, *, user: str = "", sid: str = "", detail: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO audit (ts, sid, user, event, detail) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), sid, user, event, detail))
+        self.conn.commit()
+
+    def audit_tail(self, limit: int = 20) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT ts, sid, user, event, detail FROM audit ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def audit_count(self, event: str | None = None) -> int:
+        if event is None:
+            row = self.conn.execute("SELECT COUNT(*) AS n FROM audit").fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM audit WHERE event = ?", (event,)).fetchone()
+        return int(row["n"])
 
     def set_tier(self, name: str, tier: str) -> bool:
         cur = self.conn.execute("UPDATE users SET tier = ? WHERE name = ?", (tier, name))

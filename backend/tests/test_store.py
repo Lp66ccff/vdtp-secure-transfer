@@ -103,3 +103,19 @@ def test_pending_sweep(tmp_path):
     store.save_pending("new", "alice", "[]", 9e9)
     assert store.sweep_pending(2.0) == 1
     assert store.load_pending("new", 3.0) is not None
+
+
+def test_audit_records_and_reads_back(tmp_path):
+    store = Store(str(tmp_path))
+    store.audit("auth_ok", user="alice", sid="s1")
+    store.audit("denied", user="alice", sid="s1", detail="路径越界")
+    assert store.audit_count() == 2
+    assert store.audit_count("denied") == 1
+    last = store.audit_tail(1)[0]
+    assert last["event"] == "denied" and last["detail"] == "路径越界"
+
+
+def test_audit_survives_reopen(tmp_path):
+    Store(str(tmp_path)).audit("upload_done", user="alice", detail="a.bin 1024 字节")
+    again = Store(str(tmp_path))
+    assert again.audit_count("upload_done") == 1

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from . import auth, frame as P
 from . import bucket as BK
+from .limits import Limits
 from . import transfer as X
 from .store import NAME_RE, Store, StoreError, resolve_user_path
 
@@ -26,6 +27,7 @@ HEARTBEAT_TIMEOUT = 120.0
 TICKET_TTL = 3600
 RATE_BPS = {"free": 2 << 20, "vip": 8 << 20}
 QUOTA_BYTES = {"free": 512 << 20, "vip": 4 << 30}
+LIMITS = Limits(per_ip=16, per_user=4, total=512, streams=8)
 
 app = FastAPI(title="VDTP/2 gateway", version="0.2.0")
 store = Store(DATA_DIR)
@@ -117,13 +119,26 @@ class Session:
         await self.send(ftype, P.control(obj), stream=stream)
 
     async def error(self, code: str, msg: str, stream: int = 0) -> None:
+        if code == "DENIED":
+            store.audit("denied", user=(self.user or {}).get("name", ""), sid=self.sid,
+                        detail=msg)
         await self.send_json(P.T_ERROR, {"code": code, "msg": msg, "stream": stream},
                              stream=stream)
+
+    async def auth_fail(self, msg: str) -> None:
+        store.audit("auth_failed", user=(self.user or {}).get("name", ""), sid=self.sid,
+                    detail=msg)
+        await self.error("AUTH_FAILED", msg)
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
+    ip = ws.client.host if ws.client else "?"
     await ws.accept()
+    if not LIMITS.open_conn(ip):
+        store.audit("conn_rejected", detail=f"ip={ip} 到上限")
+        await ws.close(code=1013)
+        return
     sess = Session(ws)
     dec = P.FrameDecoder()
 
@@ -156,6 +171,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        if sess.user:
+            LIMITS.close_user(sess.user["name"])
+        LIMITS.close_conn(ip)
         parked = []
         for st in list(sess.streams.values()):
             if isinstance(st, X.Upload):
@@ -215,7 +233,7 @@ async def on_hello(sess: Session, fr: P.Frame) -> None:
         return
     user = store.user(str(body.get("user", "")))
     if user is None:
-        await sess.error("AUTH_FAILED", "用户未登记，先调用 /api/register")
+        await sess.auth_fail("用户未登记，先调用 /api/register")
         return
     sess.user = user
     sess.stage = "challenged"
@@ -226,24 +244,30 @@ async def on_hello(sess: Session, fr: P.Frame) -> None:
 
 async def on_auth_response(sess: Session, fr: P.Frame) -> None:
     if sess.stage != "challenged" or sess.user is None:
-        await sess.error("AUTH_FAILED", "顺序不对，先发 HELLO")
+        await sess.auth_fail("顺序不对，先发 HELLO")
         return
     body = P.parse_control(fr.payload)
     try:
         jwk = body["pub"]
         sig = auth.ub64u(str(body["sig"]))
     except (KeyError, ValueError):
-        await sess.error("AUTH_FAILED", "AUTH_RESPONSE 字段不全")
+        await sess.auth_fail("AUTH_RESPONSE 字段不全")
         return
 
     stored = json.loads(sess.user["pubkey_jwk"])
     if auth.thumbprint(jwk) != auth.thumbprint(stored):
-        await sess.error("AUTH_FAILED", "公钥与登记的不一致")
+        await sess.auth_fail("公钥与登记的不一致")
         return
     message = sess.nonce + sess.sid.encode()
     if not auth.verify_signature(jwk, message, sig):
-        await sess.error("AUTH_FAILED", "挑战签名验不过")
+        await sess.auth_fail("挑战签名验不过")
         return
+
+    if not LIMITS.open_user(sess.user["name"]):
+        store.audit("auth_denied", user=sess.user["name"], sid=sess.sid,
+                    detail="同一账号连接数到上限")
+        await sess.error("DENIED", f"同一账号最多 {LIMITS.per_user} 条连接")
+        raise WebSocketDisconnect(code=1013)
 
     tier = sess.user["tier"]
     sess.stage = "authed"
@@ -255,6 +279,7 @@ async def on_auth_response(sess: Session, fr: P.Frame) -> None:
     })
     sess.ticket = ticket
     sess.bucket = bucket_for(sess.user["name"], tier)
+    store.audit("auth_ok", user=sess.user["name"], sid=sess.sid)
     await sess.send_json(P.T_AUTH_OK, {
         "user": sess.user["name"],
         "ticket": ticket,
@@ -292,6 +317,9 @@ async def on_list(sess: Session, fr: P.Frame) -> None:
 
 async def on_open(sess: Session, fr: P.Frame) -> None:
     assert sess.user is not None
+    if len(sess.streams) >= LIMITS.streams:
+        await sess.error("DENIED", f"单连接最多 {LIMITS.streams} 条流", stream=fr.stream)
+        return
     body = P.parse_control(fr.payload)
     mode = str(body.get("mode", "up"))
     root = store.user_root(sess.user["name"])
@@ -400,6 +428,8 @@ async def on_done(sess: Session, fr: P.Frame) -> None:
             await sess.error(code, msg, stream=fr.stream)
             return
         sess.streams.pop(st.id, None)
+        store.audit("upload_done", user=sess.user["name"], sid=sess.sid,
+                    detail=f"{st.rel} {st.size} 字节")
         await sess.send_json(P.T_DONE_OK, {"stream": st.id}, stream=st.id)
         return
     if isinstance(st, X.Download):
@@ -430,6 +460,8 @@ async def on_resume(sess: Session, fr: P.Frame) -> None:
         sess.next_stream = max(sess.next_stream, st.id + 1)
         streams.append({"stream": st.id, "mode": "up", "path": st.rel,
                         "offset": st.offset, "size": st.size, "root": meta["root"]})
+    store.audit("resume", user=sess.user["name"], sid=sess.sid,
+                detail=f"{len(streams)} 条流")
     await sess.send_json(P.T_RESUME_OK, {"sid": sess.sid, "streams": streams})
 
 
