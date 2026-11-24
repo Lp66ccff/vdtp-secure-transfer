@@ -105,6 +105,12 @@ class Store:
             return None
         return row["user"], row["payload"]
 
+    def latest_pending(self, user: str, now: float) -> tuple[str, str] | None:
+        row = self.conn.execute(
+            "SELECT sid, payload FROM pending WHERE user = ? AND expires >= ? "
+            "ORDER BY expires DESC LIMIT 1", (user, now)).fetchone()
+        return (row["sid"], row["payload"]) if row else None
+
     def drop_pending(self, sid: str) -> None:
         self.conn.execute("DELETE FROM pending WHERE sid = ?", (sid,))
         self.conn.commit()

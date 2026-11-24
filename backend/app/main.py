@@ -446,7 +446,14 @@ async def on_resume(sess: Session, fr: P.Frame) -> None:
         await sess.error("RESUME_REJECTED", "票据无效或过期")
         return
     sid = str(payload.get("sid", ""))
-    got = store.load_pending(sid, time.time())
+    now = time.time()
+    got = store.load_pending(sid, now)
+    if not got:
+        # 票据里的 sid 与挂起行对不上时，退到该用户最近的一条挂起
+        fallback = store.latest_pending(sess.user["name"], now)
+        if fallback:
+            sid, parked_json = fallback
+            got = (sess.user["name"], parked_json)
     if not got:
         await sess.error("RESUME_REJECTED", "没有可恢复的会话")
         return
