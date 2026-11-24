@@ -18,8 +18,7 @@
 - 限速：按用户档位配令牌桶，自由档 2 MiB/s、VIP 档 8 MiB/s，突发 256 KiB；下载在推流前扣额度，上传在落盘前扣。
 - 配额：按档位算用户目录实际占用，OPEN 时用“已用 + 本次声明”预判，超了回 DENIED。
 - 单测：41 项，覆盖帧编解码与模糊测试、签名验签、票据、存储与挂起表、路径越界、用量统计、令牌桶与 Merkle。
-
-防注入演示、ACL 脚本、容器验证还没做，里程碑见上层 README。
+- 安全面：nginx 只开 TLS 1.3 并做连接与请求限流，`deploy/acl.sh` 配目录 ACL，查询全参数化、用户名走白名单。
 
 ## 结构
 
@@ -77,7 +76,7 @@ npm run dev        # http://127.0.0.1:5173，/ws 与 /api 由 vite 转到 8000
 
 ```bash
 cd backend
-.venv/bin/python -m pytest -q                    # 32 项
+.venv/bin/python -m pytest -q                    # 41 项
 .venv/bin/python tools/smoke.py                  # 注册到上传下载一条龙
 .venv/bin/python tools/resume_smoke.py           # 传一半掐线，重连续传
 .venv/bin/python tools/bench_rate.py 8 free      # 量一档的实际速率
