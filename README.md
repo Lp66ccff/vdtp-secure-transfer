@@ -46,7 +46,7 @@ docker compose up -d --build
 
 ```bash
 cd backend
-.venv/bin/python -m pytest -q                    # 48 项
+.venv/bin/python -m pytest -q                    # 50 项
 .venv/bin/python tools/smoke.py                  # 注册、认证、列目录、上传下载、越权
 .venv/bin/python tools/resume_smoke.py           # 传一半掐线，重连续传
 .venv/bin/python tools/bench_rate.py 8 free      # 量一档的实际速率
