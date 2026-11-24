@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 from app import auth, frame as P  # noqa: E402
 from app import merkle  # noqa: E402
+from app.paths import data_dir
 from app.store import Store  # noqa: E402
 
 CHUNK = 256 << 10
@@ -63,7 +64,7 @@ async def main(base: str, mib: int, tier: str) -> int:
     key, jwk = make_identity()
     user = f"bench-{tier}-" + secrets.token_hex(3)
     register(base, user, jwk)
-    Store(os.environ.get("VDTP_DATA", "data")).set_tier(user, tier)
+    Store(data_dir()).set_tier(user, tier)
 
     payload = os.urandom(mib << 20)
     chunks = [payload[i:i + CHUNK] for i in range(0, len(payload), CHUNK)]

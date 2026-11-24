@@ -20,6 +20,7 @@ sys.path.insert(0, ".")
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 
 from app import auth  # noqa: E402
+from app.paths import data_dir
 from app.store import Store, resolve_user_path  # noqa: E402
 
 PAYLOADS = [
@@ -53,7 +54,7 @@ def post(base: str, path: str, body: dict) -> tuple[int, dict]:
 
 
 def main(base: str) -> int:
-    store = Store(os.environ.get("VDTP_DATA", "data"))
+    store = Store(data_dir())
     name = "demo-" + secrets.token_hex(3)
     jwk = new_jwk()
     status, body = post(base, "/api/register", {"user": name, "pub": jwk})

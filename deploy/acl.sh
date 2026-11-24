@@ -28,13 +28,20 @@ if ! getent group "$svc_group" >/dev/null; then
 fi
 
 echo "== 目录 $base"
-chown -R "$svc_user:$svc_group" "$base"
+claim() {
+	if [[ "$(id -u)" == "0" ]]; then
+		chown -R "$svc_user:$svc_group" "$1"
+	else
+		echo "（不是 root，跳过 chown：$1 已属于当前用户）"
+	fi
+}
+claim "$base"
 setfacl -m "u:$svc_user:rwx,g:$svc_group:rwx,o::---,m::rwx" "$base"
 setfacl -d -m "u:$svc_user:rwx,g:$svc_group:rwx,o::---,m::rwx" "$base"
 
 for dir in "$base"/*/; do
 	[[ -d "$dir" ]] || continue
-	chown -R "$svc_user:$svc_group" "$dir"
+	claim "$dir"
 	setfacl -m "u:$svc_user:rwx,g:$svc_group:rwx,o::---,m::rwx" "$dir"
 	setfacl -d -m "u:$svc_user:rwx,g:$svc_group:rwx,o::---,m::rwx" "$dir"
 	echo "-- $(basename "$dir")"
@@ -43,7 +50,8 @@ done
 
 echo
 echo "== 验证：其他人读不了"
-probe="$(mktemp "$base/.acl-probe.XXXX")"
+probe="$base/.acl-probe.$$"
+: > "$probe"
 if getfacl -cp "$probe" | grep -qx 'other::---'; then
 	echo "ok: 新建文件继承默认 ACL，other 位为空"
 	rc=0
