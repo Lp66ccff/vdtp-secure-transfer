@@ -1,6 +1,6 @@
 # VDTP/2
 
-安全的文件传输 Web 应用：自定义应用层协议跑在 WebSocket 二进制帧上，浏览器就是客户端。软件与系统安全实验 1B 的实现。
+安全的文件传输 Web 应用：自定义应用层协议跑在 WebSocket 二进制帧上，浏览器就是客户端。
 
 ![登录与文件列表](docs/login.png)
 
@@ -92,4 +92,4 @@ docs/
 
 运行数据放在仓库外：`$XDG_DATA_HOME/vdtp`，缺省 `~/.local/share/vdtp`，用 `VDTP_DATA` 可以改。里面有 `vdtp.db`、`ticket.key` 与 `users/<用户名>/`。
 
-演示证书在 `~/.config/vdtp/certs`（`gen_certs.sh` 生成，参数可改目录）；容器把数据放在 `vdtp-data` 卷里。两处都不进仓库。
+开发证书在 `~/.config/vdtp/certs`（`gen_certs.sh` 生成，参数可改目录）；容器把数据放在 `vdtp-data` 卷里。两处都不进仓库。

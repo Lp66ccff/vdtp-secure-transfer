@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 生成本地演示用的根证书与服务器证书。
+# 生成本地开发用的根证书与服务器证书。
 # 用法：./gen_certs.sh [输出目录]，默认 ~/.config/vdtp/certs（仓库外）
 set -euo pipefail
 

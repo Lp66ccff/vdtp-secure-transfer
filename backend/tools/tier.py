@@ -1,4 +1,4 @@
-"""改用户档位，给限速演示用。
+"""改用户档位。
 
     python3 tools/tier.py <用户名> free|vip
 """

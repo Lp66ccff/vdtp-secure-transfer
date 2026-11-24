@@ -441,7 +441,7 @@ function upOne() {
   listFiles(parts.join('/'))
 }
 
-// 开发期断线演示用：在控制台或自动化里调用 window.__vdtp.drop() 掐掉连接。
+// 开发期断线复现用：在控制台或自动化里调用 window.__vdtp.drop() 掐掉连接。
 if (import.meta.env.DEV) {
   window.__vdtp = { drop: () => ws && ws.close() }
 }
@@ -463,7 +463,7 @@ function leave() {
     <header class="head">
       <div>
         <h1>VDTP/2 文件传输</h1>
-        <p class="sub">软件与系统安全 · 实验 1B · 自定义应用层协议跑在 WebSocket 上</p>
+        <p class="sub">安全文件传输 · 自定义应用层协议跑在 WebSocket 上</p>
       </div>
       <div class="who">
         <span v-if="entered" class="chip mono">{{ user }}</span>
