@@ -12,6 +12,8 @@
 - 多流并发：一条连接同时传多个文件，每个文件一条流。
 - 按身份限速：令牌桶按档位，自由档 2 MiB/s、VIP 档 8 MiB/s，突发 256 KiB。
 - 配额：按档位算用户目录占用，OPEN 时用已用量加声明大小预判。
+- 连接上限：每 IP 16 条、每账号 4 条、每连接 8 条流、全局 512 条，超了回 DENIED 或直接关连接。
+- 审计：认证结果、DENIED、上传完成与续传各记一条，落在 SQLite 的 `audit` 表。
 - 安全面：nginx 只开 TLS 1.3 并做连接与请求限流，`deploy/acl.sh` 配目录 ACL，查询全参数化、用户名走白名单。
 
 ## 起服务
@@ -44,7 +46,7 @@ docker compose up -d --build
 
 ```bash
 cd backend
-.venv/bin/python -m pytest -q                    # 41 项
+.venv/bin/python -m pytest -q                    # 48 项
 .venv/bin/python tools/smoke.py                  # 注册、认证、列目录、上传下载、越权
 .venv/bin/python tools/resume_smoke.py           # 传一半掐线，重连续传
 .venv/bin/python tools/bench_rate.py 8 free      # 量一档的实际速率
@@ -67,14 +69,15 @@ sudo ../deploy/acl.sh data                       # 目录 ACL 配置与自检
 | seq | 4 | 流内序号，从 1 递增 |
 | length | 4 | 载荷长度，上限 1 MiB |
 
-19 种消息分六组：握手、认证、目录、传输、恢复、其它；连接经 CONNECTED、CHALLENGED、AUTHED、CLOSED 四个状态，认证前只收 HELLO、AUTH_RESPONSE 与 PING。帧头位图、消息表、状态机与资源边界见 [docs/协议.md](docs/协议.md)。
+19 种消息分六组：握手、认证、目录、传输、恢复、其它；连接经 CONNECTED、CHALLENGED、AUTHED、CLOSED 四个状态，认证前只收 HELLO、AUTH_RESPONSE 与 PING。连接与流的上限、资源边界见协议文档。帧头位图、消息表、状态机与资源边界见 [docs/协议.md](docs/协议.md)。
 
 ## 目录
 
 ```
 backend/
   app/          frame.py 帧编解码、auth.py 签名与票据、store.py SQLite 与钉根、
-                transfer.py 上传下载与续传、bucket.py 令牌桶、main.py 端点
+                transfer.py 上传下载与续传、bucket.py 令牌桶、limits.py 连接与流上限、
+                main.py 端点
   tests/        单元测试
   tools/        smoke.py、resume_smoke.py、bench_rate.py、inject_demo.py、tier.py
 frontend/
