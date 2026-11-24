@@ -55,13 +55,18 @@ export async function upload(ch, file, name, onProgress) {
   return { stream, root }
 }
 
-export async function download(ch, path, onProgress) {
+// state 跨断线保留：{ buf, offset }。重连后带 offset 重开下载流，服务端从该偏移推。
+export async function download(ch, path, onProgress, state = {}) {
   const stream = ch.nextStream()
-  ch.sendJson(T.OPEN, { path, mode: 'down' }, stream)
+  const ask = state.offset || 0
+  const body = { path, mode: 'down' }
+  if (ask > 0) body.offset = ask
+  ch.sendJson(T.OPEN, body, stream)
   const opened = await ch.waitFor((f) => f.stream === stream && (f.type === T.OPEN_OK || f.type === T.ERROR))
   if (opened.type === T.ERROR) throw errorOf(opened)
   const { size } = parseControl(opened.payload)
-  const buf = new Uint8Array(size)
+  if (!state.buf || state.buf.length !== size) state.buf = new Uint8Array(size)
+  const buf = state.buf
 
   while (true) {
     const fr = await ch.waitFor((f) => f.stream === stream
@@ -71,8 +76,9 @@ export async function download(ch, path, onProgress) {
       const offset = Number(new DataView(fr.payload.buffer, fr.payload.byteOffset, 8).getBigUint64(0))
       const chunk = fr.payload.subarray(8)
       buf.set(chunk, offset)
-      ch.sendJson(T.ACK, { offset: offset + chunk.length }, stream)
-      onProgress(offset + chunk.length, size)
+      state.offset = offset + chunk.length
+      ch.sendJson(T.ACK, { offset: state.offset }, stream)
+      onProgress(state.offset, size)
       continue
     }
     const body = parseControl(fr.payload)

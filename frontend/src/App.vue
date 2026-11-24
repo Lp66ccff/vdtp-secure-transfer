@@ -27,6 +27,8 @@ let pingSentAt = 0
 let identity = null
 let lastTicket = ''
 let resumeCtx = null
+let downCtx = null
+let pendingDown = null
 const resumable = ref(null)
 const waiters = []
 let itemSeq = 0
@@ -230,6 +232,12 @@ async function onFrame(frame) {
       send(T.RESUME, control({ ticket: resumeCtx.ticket }))
       return
     }
+    if (pendingDown) {
+      const ctx = pendingDown
+      pendingDown = null
+      void continueDownload(ctx)
+      return
+    }
     ping()
     listFiles('')
     return
@@ -322,7 +330,7 @@ async function uploadOne(file) {
       item.status = '中断'
       if (item.acked) item.done = item.acked
       resumeCtx = { file, rel, item, ticket: lastTicket }
-      resumable.value = { name: file.name, size: file.size }
+      resumable.value = { kind: 'up', name: file.name, size: file.size }
     } else {
       item.status = '失败'
       item.error = err.message
@@ -342,9 +350,20 @@ async function handleFiles(event) {
 }
 
 function resume() {
+  if (resumable.value && resumable.value.kind === 'down') {
+    if (!downCtx) return
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      pendingDown = downCtx
+      connect()
+      return
+    }
+    banner.value = ''
+    void continueDownload(downCtx)
+    return
+  }
   if (!resumeCtx) return
   banner.value = ''
-  resumable.value = { name: resumeCtx.file.name, size: resumeCtx.file.size }
+  resumable.value = { kind: 'up', name: resumeCtx.file.name, size: resumeCtx.file.size }
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     connect()
     return
@@ -385,15 +404,35 @@ async function fetchEntry(entry) {
   }
   const item = pushItem(entry.name, entry.size, 'down')
   item.status = '下载中'
+  await runDownload({
+    rel: files.path ? `${files.path}/${entry.name}` : entry.name,
+    name: entry.name, item, state: {},
+  })
+}
+
+async function runDownload(ctx) {
   try {
-    const rel = files.path ? `${files.path}/${entry.name}` : entry.name
-    const buf = await download(ch, rel, (done) => { item.done = done })
-    await saveBlob(buf, entry.name)
-    item.status = '完成'
+    const buf = await download(ch, ctx.rel, (done) => { ctx.item.done = done }, ctx.state)
+    await saveBlob(buf, ctx.name)
+    ctx.item.status = '完成'
+    downCtx = null
   } catch (err) {
-    item.status = '失败'
-    item.error = err.message
+    if (status.value === 'closed' || /连接断开/.test(err.message)) {
+      ctx.item.status = '中断'
+      downCtx = ctx
+      resumable.value = { kind: 'down', name: ctx.name, size: ctx.item.size }
+    } else {
+      ctx.item.status = '失败'
+      ctx.item.error = err.message
+    }
   }
+}
+
+async function continueDownload(ctx) {
+  downCtx = null
+  resumable.value = null
+  ctx.item.status = '下载中'
+  await runDownload(ctx)
 }
 
 function upOne() {
@@ -494,7 +533,7 @@ function leave() {
           </ul>
 
           <div v-if="resumable" class="resume">
-            <span>上次没传完：{{ resumable.name }}</span>
+            <span>{{ resumable.kind === 'down' ? '上次没下完' : '上次没传完' }}：{{ resumable.name }}</span>
             <button class="tiny" @click="resume">续传</button>
           </div>
         </article>
