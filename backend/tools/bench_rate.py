@@ -1,4 +1,4 @@
-"""量一档的实际上传速率，给报告的实验数据用。
+"""量一档的实际上传速率。
 
     python3 tools/bench_rate.py [MiB] [free|vip]
 
